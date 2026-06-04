@@ -52,6 +52,7 @@ import logging
 import threading
 import math
 import re
+import hmac
 from flask import Flask, render_template, jsonify, request, send_file
 from flask_cors import CORS
 from typing import Dict, List, Set
@@ -115,6 +116,7 @@ class WebUI:
         webui_config = config.get('webui', {})
         self.external_url_provider = str(webui_config.get('external_url_provider', 'openwx'))
         self.external_url_custom = str(webui_config.get('external_url_custom', ''))
+        self.settings_password = str(webui_config.get('settings_password', '') or '')
         
         # References to other components for health monitoring
         self.spectrum_analyzer = None
@@ -498,6 +500,9 @@ class WebUI:
         def set_runtime_config():
             """Update debug_mode, snr_threshold, or scan_interval at runtime (no restart)."""
             try:
+                auth_error = self._require_settings_authorization()
+                if auth_error is not None:
+                    return auth_error
                 data = request.get_json() or {}
                 dm = self.decoder_manager
                 changed = []
@@ -638,6 +643,9 @@ class WebUI:
             """Update configuration and restart service"""
             try:
                 import subprocess
+                auth_error = self._require_settings_authorization()
+                if auth_error is not None:
+                    return auth_error
                 
                 data = request.get_json()
                 sdr_type = data.get('sdr_type')
@@ -766,6 +774,9 @@ class WebUI:
         def save_config_sections():
             """Save one or more config sections to config.yaml (requires service restart)."""
             try:
+                auth_error = self._require_settings_authorization()
+                if auth_error is not None:
+                    return auth_error
                 import yaml
                 data = request.get_json() or {}
                 config_path = 'config.yaml'
@@ -1004,6 +1015,18 @@ class WebUI:
             except Exception as e:
                 self.logger.error(f"Error exporting action log: {e}")
                 return str(e), 500
+
+    def _require_settings_authorization(self):
+        """Return a Flask response tuple when settings write access is denied."""
+        if not self.settings_password:
+            return None
+
+        provided_password = request.headers.get('X-Settings-Password', '')
+        if hmac.compare_digest(str(provided_password), self.settings_password):
+            return None
+
+        self.logger.warning("Denied settings write request due to missing/invalid password")
+        return jsonify({'success': False, 'error': 'Unauthorized settings access'}), 401
     
     def _setup_action_logger(self):
         """Setup JSON action logger"""

@@ -57,45 +57,45 @@ sdr:
   # Uses receivemultisonde.sh from https://github.com/flux242/radiosonde
   # Can decode 5-6 sondes simultaneously with single RTL-SDR!
   flux242:
-    center_freq: 403600000  	# Center frequency in Hz (tune to middle of your sonde band)
-    sample_rate: 2400000    	# Sample rate (2.4 MHz recommended, covers ~2.4 MHz bandwidth)
-    gain: 40                	# Tuner gain (0 = auto, or 0-50)
-    ppm_error: 0            	# PPM frequency correction
-    threshold: 4            	# Detection threshold in dB (4-5 recommended, lower = more sensitive)
-    udp_port: 5678          	# UDP port for decoded JSON frames
-    power_port: 5676        	# UDP port for power scanning data
-    debug_port: 5675        	# UDP port for debug info
+    center_freq: 403600000      # Center frequency in Hz (tune to middle of your sonde band)
+    sample_rate: 2400000        # Sample rate (2.4 MHz recommended, covers ~2.4 MHz bandwidth)
+    gain: 40                    # Tuner gain (0 = auto, or 0-50)
+    ppm_error: 0                # PPM frequency correction
+    threshold: 4                # Detection threshold in dB (4-5 recommended, lower = more sensitive)
+    udp_port: 5678              # UDP port for decoded JSON frames
+    power_port: 5676            # UDP port for power scanning data
+    debug_port: 5675            # UDP port for debug info
     script_path: '/home/pi/radiosonde/scripts/receivemultisonde.sh'  # ABSOLUTE path to receivemultisonde.sh (update this!)
 
   # Airspy Mini / Airspy 2 settings
   # Requires Airspy support installed via install.sh (sdr.airspy_support: true)
   airspy:
-    serial: ''              	# Leave empty to use first detected Airspy device
-    center_freq: 404000000  	# Center frequency in Hz (e.g. 404.0 MHz)
-    sample_rate: 10000000    	# Sample rate in Hz: Airspy Mini = 3000000 or 6000000 / Airspy R2 = 2500000 or 10000000
-    decode_mode: legacy     	# 'legacy' = reliable airspy_rx -> sox -> decoder path, 'channelizer' = experimental Python multi-channel path
-    gain: 14                	# LNA gain (0-14 max). Mixer and VGA are also set to this value (clamped to 0-15)
-    scan_gain: 12           	# Scan gain (0-14). Lower than decode gain helps avoid overload near local launches.
-    scan_gain_fallback: 6   	# Auto fallback scan gain when clipping is detected.
+    serial: ''                  # Leave empty to use first detected Airspy device
+    center_freq: 404000000      # Center frequency in Hz (e.g. 404.0 MHz)
+    sample_rate: 10000000        # Sample rate in Hz: Airspy Mini = 3000000 or 6000000 / Airspy R2 = 2500000 or 10000000
+    decode_mode: legacy         # 'legacy' = reliable airspy_rx -> sox -> decoder path, 'channelizer' = experimental Python multi-channel path
+    gain: 14                    # LNA gain (0-14 max). Mixer and VGA are also set to this value (clamped to 0-15)
+    scan_gain: 12               # Scan gain (0-14). Lower than decode gain helps avoid overload near local launches.
+    scan_gain_fallback: 6       # Auto fallback scan gain when clipping is detected.
     scan_clip_trigger_pct: 0.2  # Trigger fallback scan if >= this % of IQ samples are near full-scale.
-    airspy_qi_order: false  	# false = IQ interleaved, true = QI interleaved; only needed for channelizer/scanner experiments
-    legacy_snap_hz: 10000   	# In legacy mode, snap auto-detected frequencies to this grid before tuning (10 kHz matches common RS41 channels)
+    airspy_qi_order: false      # false = IQ interleaved, true = QI interleaved; only needed for channelizer/scanner experiments
+    legacy_snap_hz: 10000       # In legacy mode, snap auto-detected frequencies to this grid before tuning (10 kHz matches common RS41 channels)
     legacy_probe_offsets_hz: [0, 1000, -1000, 2000, -2000, 5000, -5000]  # Legacy startup retune probe around the snapped frequency; widen this for drift-prone sondes like DFM
-    ppm_correction: 0       	# Frequency correction in PPM
-    max_decoders: 4         	# Used by channelizer mode; legacy mode forces a single active decoder for reliability
+    ppm_correction: 0           # Frequency correction in PPM
+    max_decoders: 4             # Used by channelizer mode; legacy mode forces a single active decoder for reliability
 
 # Virtual Receiver Configuration
 receivers:
-  max_concurrent: 1         	# Max concurrent decoders per RTL-SDR device (1 recommended, 2 possible but may impact performance)
-  bandwidth: 12000          	# Bandwidth per receiver (Hz)
-  scan_interval: 15          	# Spectrum scan interval (seconds)
-  min_signal_strength: -20  	# Minimum SNR in dB
+  max_concurrent: 1             # Max concurrent decoders per RTL-SDR device (1 recommended, 2 possible but may impact performance)
+  bandwidth: 12000              # Bandwidth per receiver (Hz)
+  scan_interval: 15              # Spectrum scan interval (seconds)
+  min_signal_strength: -20      # Minimum SNR in dB
 
 # Radiosonde Detection
 detection:
   # Frequency ranges to scan (in Hz)
   freq_ranges:
-    - [400000000, 406000000]  	# 400-406 MHz
+    - [400000000, 406000000]      # 400-406 MHz
   
   # Frequency blacklist - exclude known birdies or undecodable signals (in MHz)
   # Example: [401.90, 403.20, 405.50]
@@ -103,13 +103,13 @@ detection:
   
   # Priority frequency - check this frequency first at startup before scanning
   # Set to null or 0 to disable priority checking
-  priority_frequency: null  	# Frequency in MHz (e.g., 402.700)
-  priority_sonde_type: null  	# Expected sonde type: RS41, RS92, DFM, M10, M20, iMet (null = auto-detect)
-  priority_check_timeout: 30  	# Seconds to wait for decoding before starting scanner  
+  priority_frequency: null      # Frequency in MHz (e.g., 402.700)
+  priority_sonde_type: null      # Expected sonde type: RS41, RS92, DFM, M10, M20, iMet (null = auto-detect)
+  priority_check_timeout: 30      # Seconds to wait for decoding before starting scanner  
   # Signal detection thresholds
   fft_size: 2048
-  detection_threshold: 18   	# dB above noise floor for RTL-SDR spectrum scanning
-  scan_threshold: 10        	# dB above noise floor for Airspy FFT scanning (averaged, so lower is fine)
+  detection_threshold: 18       # dB above noise floor for RTL-SDR spectrum scanning
+  scan_threshold: 10            # dB above noise floor for Airspy FFT scanning (averaged, so lower is fine)
 
   # Scan interval override (seconds) — how long to wait between Airspy scans when no signal found
   # Overrides receivers.scan_interval for the Airspy mode.
@@ -130,9 +130,9 @@ detection:
   # This is much more accurate than bandwidth-based detection
   # dft_detect built automatically from rs1729/RS during install.sh
   # Source: https://github.com/rs1729/RS/tree/master/scan
-  use_dft_detect: true      	# Enable DFT correlation detection (auto-fallback to bandwidth if unavailable)
+  use_dft_detect: true          # Enable DFT correlation detection (auto-fallback to bandwidth if unavailable)
   dft_detect_path: 'dft_detect' # Path to dft_detect binary (or just 'dft_detect' if in PATH)
-  dft_sample_duration: 5.0  	# Duration of IQ sample capture for analysis (seconds)
+  dft_sample_duration: 5.0      # Duration of IQ sample capture for analysis (seconds)
   
   # Supported sonde types (auto-detect)
   sonde_types:
@@ -166,6 +166,7 @@ webui:
   host: '0.0.0.0'
   port: 5000
   debug: false
+  settings_password: ''           # Optional password required for Web UI settings changes
   
   # External URL settings
   # Provider: 'openwx', 'sondehub', or 'custom'
@@ -224,24 +225,24 @@ openwx:
   # MQTT upload to OpenWX.de broker
   mqtt:
     enabled: true
-    server: '192.168.1.123'           		# MQTT broker hostname or IP
-    port: 1883                        		# MQTT broker port (1883 = plain, 8883 = TLS)
-    username: '<username>'               	# MQTT username (leave empty if not required)
-    password: '<password'              		# MQTT password (leave empty if not required)
+    server: '192.168.1.123'                   # MQTT broker hostname or IP
+    port: 1883                                # MQTT broker port (1883 = plain, 8883 = TLS)
+    username: '<username>'                   # MQTT username (leave empty if not required)
+    password: '<password'                      # MQTT password (leave empty if not required)
     topic_prefix: 'OPENWXSDR/<callsign>'  # MQTT topic prefix (e.g. OPENWXSDR/<callsign>/<serial>)
-    client_id: '<callsign>'             	# MQTT client ID
-    keepalive: 60                     		# MQTT keepalive in seconds
-    connect_timeout: 10               		# Wait this many seconds for initial CONNACK
-    tls_enabled: true                	  	# Set false for username/password brokers on plain TCP (usually port 1883)
-    tls_insecure: true                		# Accept brokers by IP/self-signed cert without CA validation
-    tls_ca_certs: ''                  		# Optional CA bundle path for strict TLS validation
-    transport: 'tcp'                  		# MQTT transport
+    client_id: '<callsign>'                 # MQTT client ID
+    keepalive: 60                             # MQTT keepalive in seconds
+    connect_timeout: 10                       # Wait this many seconds for initial CONNACK
+    tls_enabled: true                          # Set false for username/password brokers on plain TCP (usually port 1883)
+    tls_insecure: true                        # Accept brokers by IP/self-signed cert without CA validation
+    tls_ca_certs: ''                          # Optional CA bundle path for strict TLS validation
+    transport: 'tcp'                          # MQTT transport
 
 # ============================================================
 # SondeHub Upload
 # ============================================================
 sondehub:
-  enabled: false								            # true = normal upload, false = disabled, "json" = log payloads to data/logs/<serial>.json without uploading
+  enabled: false                                            # true = normal upload, false = disabled, "json" = log payloads to data/logs/<serial>.json without uploading
   queue_mode: false                         # false = direct upload mode, true = queued batch upload mode
   queue_batch_max: 200                      # Max telemetry objects uploaded per queued request (10-fast 50-robust)
   queue_max_size: 2000                      # Max queued  objects before oldest/new drops may occur (200-fast 1000-robust)
@@ -250,7 +251,7 @@ sondehub:
   station_id: '<callsign>'                  # Station ID (use callsign/SSID style)
   uploader_callsign: '<callsign>'           # Receiver callsign shown in SondeHub
   uploader_antenna: '1/4 wave UHF vertical' # Receiver antenna info shon in SondeHub
-  uploader_radio: 'RTLSDR + rs1729'     		# Optional receiver hardware/radio description
+  uploader_radio: 'RTLSDR + rs1729'             # Optional receiver hardware/radio description
   contact_email: ''                         # Optional contact email for listener metadata
   uploader_lat: 52.000                      # Must match station.lat above
   uploader_lon: 10.000                      # Must match station.lon above

@@ -2689,11 +2689,7 @@ ${trkSegs}
                 external_url_provider: document.getElementById('externalUrlProvider').value,
             };
             try {
-                const r = await fetch('/api/runtime_config', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(payload)
-                });
+                const r = await _postSettingsRequest('/api/runtime_config', payload);
                 const data = await r.json();
                 if (data.success) {
                     // Update the global variable
@@ -2708,14 +2704,50 @@ ${trkSegs}
         // Alias for compatibility with old saveConfiguration() call
         async function saveConfiguration() { await saveGeneralConfig(); }
 
+        let _settingsPasswordCache = '';
+
+        async function _postSettingsRequest(url, payload) {
+            const buildHeaders = () => {
+                const headers = {'Content-Type': 'application/json'};
+                if (_settingsPasswordCache) {
+                    headers['X-Settings-Password'] = _settingsPasswordCache;
+                }
+                return headers;
+            };
+
+            let response = await fetch(url, {
+                method: 'POST',
+                headers: buildHeaders(),
+                body: JSON.stringify(payload)
+            });
+
+            if (response.status !== 401) {
+                return response;
+            }
+
+            const entered = prompt('Enter settings password:');
+            if (entered === null) {
+                return response;
+            }
+
+            _settingsPasswordCache = entered;
+            response = await fetch(url, {
+                method: 'POST',
+                headers: buildHeaders(),
+                body: JSON.stringify(payload)
+            });
+
+            if (response.status === 401) {
+                _settingsPasswordCache = '';
+            }
+
+            return response;
+        }
+
         async function _saveConfigSection(payload) {
             if (!confirm('Save changes to config.yaml and restart the service?')) return;
             try {
-                const r = await fetch('/api/save_config_sections', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(payload)
-                });
+                const r = await _postSettingsRequest('/api/save_config_sections', payload);
                 const data = await r.json();
                 if (data.success) {
                     const configurationModal = bootstrap.Modal.getInstance(document.getElementById('configurationModal'));
