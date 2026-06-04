@@ -2704,7 +2704,27 @@ ${trkSegs}
         // Alias for compatibility with old saveConfiguration() call
         async function saveConfiguration() { await saveGeneralConfig(); }
 
+        const SETTINGS_PASSWORD_CACHE_TIMEOUT_MS = 5 * 60 * 1000;
         let _settingsPasswordCache = '';
+        let _settingsPasswordTimer = null;
+
+        function _clearSettingsPasswordCache() {
+            _settingsPasswordCache = '';
+            if (_settingsPasswordTimer) {
+                clearTimeout(_settingsPasswordTimer);
+                _settingsPasswordTimer = null;
+            }
+        }
+
+        function _cacheSettingsPassword(password) {
+            _settingsPasswordCache = password;
+            if (_settingsPasswordTimer) {
+                clearTimeout(_settingsPasswordTimer);
+            }
+            _settingsPasswordTimer = setTimeout(_clearSettingsPasswordCache, SETTINGS_PASSWORD_CACHE_TIMEOUT_MS);
+        }
+
+        window.addEventListener('beforeunload', _clearSettingsPasswordCache);
 
         async function _postSettingsRequest(url, payload) {
             const buildHeaders = () => {
@@ -2730,7 +2750,7 @@ ${trkSegs}
                 return response;
             }
 
-            _settingsPasswordCache = entered;
+            _cacheSettingsPassword(entered);
             response = await fetch(url, {
                 method: 'POST',
                 headers: buildHeaders(),
@@ -2738,7 +2758,7 @@ ${trkSegs}
             });
 
             if (response.status === 401) {
-                _settingsPasswordCache = '';
+                _clearSettingsPasswordCache();
             }
 
             return response;

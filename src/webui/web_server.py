@@ -1022,7 +1022,9 @@ class WebUI:
             return None
 
         provided_password = request.headers.get('X-Settings-Password', '')
-        if hmac.compare_digest(str(provided_password), self.settings_password):
+        provided_bytes = str(provided_password).encode('utf-8')
+        expected_bytes = self.settings_password.encode('utf-8')
+        if hmac.compare_digest(provided_bytes, expected_bytes):
             return None
 
         self.logger.warning("Denied settings write request due to missing/invalid password")
