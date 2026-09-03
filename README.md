@@ -6,43 +6,89 @@ Using the excellent rs1729/RS decoders embedded into this framework.
 <img width="820" height="558" alt="grafik" src="https://github.com/user-attachments/assets/3a453239-0042-430c-a2f8-44a2a7420c71" />
 
 
-## Current Version:** 1.0.61 (July 24, 2026):
+## Current Version:** 1.0.62 (August 09, 2026):
 
 ⚠ <u>Important notice:</u> From version 1.0.60 and higher upload of radiosonde telemetry to sondehub.org is now available for this sondetypes:
-- RS41
-- DFM06
-- DFM09
-- DFM17
-- M10
-- M20
+- RS41  (from v1.0.60)
+- DFM06 (from v1.0.60)
+- DFM09 (from v1.0.60)
+- DFM17 (from v1.0.60)
 
-We are working on RS92 data validation in the next step. Due to the rare availability this may take some time. If you receive RS92 in your area please send us your logfiles.
+- M10   (from v1.0.61)
+- M20   (from v1.0.61)
 
-✨ What's New in v1.0.61
+- RS92  (from v1.0.62)
 
-#### 📊 Band sweep mode with Frequency repository
+The RS92 data validation was successfully granted, it may take some time until sondehub makes the infrastructure update.
 
-- **Band sweep mode**: Scan the complete sondeband with a single SDR
-- **Frequency repository**: Detected frequencies are stored within the session for later decoding
-- **Detection cascade fixed**: Wrong detected sondetype will be skipped for a cooldown period
+## ✨ What's New in v1.0.62
 
-✨ What's New in v1.0.60
+## Decoding & detection
 
-#### 📡 SondeHub Upload Correctness completed, uploaded is being granted with >= V1.0.60)
+- **Pinned decoder source.** `scripts/install_softchain.sh` now clones
+  `radiosonde_auto_rx` at a fixed tag (`v1.8.2`, override with `AUTORX_REF`), so
+  every gateway builds *identical* `dft_detect` / `fsk_demod` / `iq_dec` / `*mod`
+  binaries — no more per‑install behaviour drift.
+- **RS41 bandwidth fast‑path is now OFF by default.** Every candidate is
+  classified purely by `dft_detect` correlation (auto_rx's method), which removes
+  the bandwidth‑guess that let a narrow‑measuring DFM start as RS41. Re‑enable per
+  gateway with `detection.rs41_fastpath: true` (≈15 s faster RS41 start).
+- **dft_detect classification hardened:** M10/M20 negative‑correlation now compared
+  by magnitude (fixes M10/M20 being mis‑typed), MRZ + iMet variants + build
+  suffixes (RS41SG) added to the parser, and unreachable "no type passed
+  threshold" logging fixed (now reports each type's score for calibration).
+  Thresholds are config‑driven via `detection.dft_thresholds`.
+- **DFM decode fix:** `--dist/--ptu/-ID` are gated on `--help` only (field
+  `dfm09mod` rejects them → exit 255 → dead DFM). M10/M20 flags passed
+  unconditionally. Soft‑chain params aligned with auto_rx (`--mask 5000
+  --nsym=300 -p 5`, DFM `-i`). `datetime.utcnow()` deprecation removed.
+- **iq_dec inline DC removal** (auto_rx method) available in both the `--IQ` and
+  soft chains via `decoders.iq_dc_block`.
 
-#### 🎯 Detection Sensivity (optional softchain input)
-- Using decoders softin mode like radiosonde_auto_rx you get 2dB improved signal sensitivy
+## Airspy
 
-#### 📊 Inline iq_dec DC removal
-- New decoders.iq_dc_block (default false) routes rtl_fm -M raw cs16 IQ through rs1729 iq_dec (--bo 16, +--IFbw for >80 kHz) before the --IQ decoder (learned from auto_rx)
+- **Ghost / "birdie" reject.** The scanner now rejects strong‑but‑narrow peaks
+  (CW/spurs) that were starting phantom decoders — configurable via
+  `sdr.airspy.birdie_reject_snr_db` / `birdie_reject_bw_hz` / `scan_min_bw_hz`.
 
-#### 🔧 Important bugfixes:
-- PTU Data Handling fixed (there was a stupid bug in the recent versions!)
-- Fixed gain:0 deafness, auto-gain was implemented wrong 
-- Incomplete handling of import from api.v2.sondehub.org fixed - distance filter was not working
+## Web UI & map
 
-#### ⚙️ Improved USB Device handling and optional USB reset if device failed during the day
-- Stucked devices will be handle by watchdog and restarted in configured
+- **System Statistics tiles:** Active‑Sondes 3‑dot menu (Active / Total); Frames
+  menu (Total / Today's, new UTC‑day counter); CPU/RAM Live / Graph (60‑min
+  chart, full‑row when graphed).
+- **Sonde tiles:** Standard / Extended 3‑dot menu (Extended row shows Distance /
+  Elevation / Battery, height‑aware); M10/M20/DFM show **battery** instead of SNR;
+  header time as `…Z`; correct **DFM subtype** badges (DFM06/09/17) resolved from
+  the log with correct colours.
+- **Own‑gateway map marker.** Click for identity/hardware + the sondes received in
+  the last `sonde_retention_time` window, each with height‑aware **slant distance,
+  elevation and course**. Right‑click → **Landings** (25/50/100/150 km range
+  rings + last‑position markers) / **Heatmap** (last positions) / **Clear**, with a
+  "Loading data …" dialog.
+- **Landings:** live‑styled popups (id, date/time, position, altitude, v‑vel,
+  frequency, distance); right‑click a landing → **Show / Clear sonde path**
+  (polyline loaded from the logfile).
+- **Sonde Statistics modal:** **server‑side LTTB decimation** (huge speed‑up on
+  long flights, `?max_points`); new **Elevation** chart with a second **Distance**
+  line on a right axis; tiles reordered (Altitude|Elevation, HVel|VVel,
+  Sats|Battery, SNR|RSSI); sonde identity in the title and maximized headers;
+  fixed missing frequency when opened via right‑click on an active tile.
+- **Gateway details** modal shows Hostname/IP, version, memory/disk.
+- Fixed a stuck "Loading data …" modal backdrop (Bootstrap show/hide race), and
+  M10/M20 dashed‑serial (`210‑2‑11234‑…`) logfile loading being truncated to
+  `210`.
+
+## RS92 GPS ephemeris
+
+- Opt‑in downloader (`rs92.ephemeris_download`) fetches the current GPS‑day
+  broadcast ephemeris into `data/rs92` and feeds `rs92mod -e` for a position
+  solve. Default source is **BKG** (Germany, HTTPS, no login) RINEX3 mixed‑nav
+  `BRDC00WRD_R_<yyyy><doy>0000_01D_MN.rnx.gz`. Runs in the background with
+  retry/backoff (recovers a network‑not‑ready‑at‑boot failure) and re‑checks
+  hourly for the UTC‑midnight day rollover. A **System Health "Ephemeris"** row
+  shows ready/pending (only when enabled).
+
+See changelog in the release section for all details.
 
 #### 🔧 New configuration utility
 
@@ -73,57 +119,6 @@ In band sweep mode a single SDR checks the whole radiosonde spectrum and writes 
 
 
 
-# Version below V1.0.60 are outdated - Please use versions below only standalone! #
-
-## ✨ What's New in v1.0.50
-
-#### 🔧 PTU Data Improvements
-
-- **Recency-Based PTU Merging**: Improved text fallback matching handles frame number misalignment
-- **--softin Detection**: Auto-detects decoder capabilities at startup with clear warnings
-- **Conditional Environment**: Only populates PTU when actual measurements exist
-- **Smarter Cache Management**: Timestamp-based cleanup maintains last 100 entries
-
-#### 🎯 Interactive Sonde Analysis
-
-- **Context Menu**: Right-click any active sonde for quick access to statistics and predictions
-- **Advanced Statistics Modal**: 7 interactive Chart.js graphs showing:
-  - Altitude profile
-  - Vertical velocity
-  - Horizontal velocity
-  - RSSI (signal strength)
-  - SNR (signal-to-noise ratio)
-  - GPS satellites count
-  - Battery voltage
-- **Historical Data Viewer**: Load and analyze logfiles from past flights with dropdown selector
-- **24-Hour Time Format**: All charts use UTC time in HH:mm format for professional meteorological analysis
-- **Gap Visualization**: Charts correctly show data gaps where telemetry was unavailable
-
-#### 🗺️ Enhanced Map Features
-
-- **Launch & Landing Markers**: Visual PNG icons mark takeoff and touchdown locations
-- **Flight Path Overlay**: Display historical tracks from logfiles on the map
-- **Inactive Sondes Management**: Track and manage previously decoded sondes with easy removal
-- **Position Details**: Lat/Lon coordinates displayed in landing marker popups
-
-#### 🔮 Flight Path Prediction
-
-- **Tawhiri Integration**: Real-time flight path prediction using Sondehub's Tawhiri API
-- **Intelligent Burst Altitude**: Automatic burst height estimation based on sonde type:
-  - RS41: 30,000m (Bergen: 33,500m, Meppen: 25,000m)
-  - DFM: 17,500m
-  - Others: 25,000m
-- **Drag Compensation**: Physics-based descent rate calculation accounting for air density
-- **Visual Prediction**: Purple dashed line showing predicted trajectory
-- **Landing Details**: Interactive popup with landing time, coordinates, and flight parameters
-- **Burst Marker**: Shows estimated balloon burst location for ascending sondes
-
-#### 📊 Data Improvements
-
-- **Battery Tracking**: Complete battery voltage history now recorded and displayed
-- **Satellite Data**: GPS satellite count tracking throughout flight
-- **Enhanced Logfile Format**: All telemetry fields properly logged with timestamps
-- **Live Data API**: Real-time statistics for active sondes via REST API
 
 ## Features
 
