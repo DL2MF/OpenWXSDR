@@ -2,9 +2,9 @@
 OpenWXSDR - Streamlined Radiosonde Decoder Framework
 """
 
-__version__ = '1.0.61'
-__build_date__ = '2026-07-24'
-__release_date__ = 'July 24, 2026'
+__version__ = '1.0.62'
+__build_date__ = '2026-08-09'
+__release_date__ = 'August 9, 2026'
 __software_name__ = 'OpenWXSDR'
 __author__ = 'DL2MF@darc.de'
 

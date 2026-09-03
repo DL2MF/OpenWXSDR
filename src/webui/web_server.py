@@ -45,6 +45,7 @@
 """
 
 import os
+import sys
 import socket
 import subprocess
 import shutil
@@ -95,6 +96,8 @@ class WebUI:
         self.sondes: Dict[str, List[dict]] = {}
         self.total_frames_received = 0  # Total frames ever received
         self.total_sondes_received = 0  # Total unique sondes ever received
+        self._today_frames = 0          # Frames received on the current UTC day
+        self._today_frames_date = datetime.utcnow().strftime('%Y-%m-%d')  # UTC day the counter belongs to
         self.active_frequencies = set()  # Currently active frequencies
         self.lock = threading.Lock()
         self.start_time = time.time()  # Track uptime
@@ -198,6 +201,7 @@ class WebUI:
                                  tile_server=map_config['tile_server'],
                                  station_lat=station_cfg.get('lat', map_config['default_lat']),
                                  station_lon=station_cfg.get('lon', map_config['default_lon']),
+                                 station_alt=station_cfg.get('alt', 0),
                                  callsign=station_cfg.get('callsign', ''),
                                  version=__version__,
                                  build_date=__build_date__,
@@ -261,6 +265,7 @@ class WebUI:
                         'frequency': latest.get('frequency'),
                         'rssi': latest.get('rssi'),
                         'snr': latest.get('snr'),
+                        'battery': latest.get('batt'),  # battery voltage (M10/M20/DFM tiles show this instead of SNR)
                         'temp': latest.get('temp'),
                         'humidity': latest.get('humidity'),
                         'pressure': latest.get('pressure'),
@@ -276,9 +281,81 @@ class WebUI:
                     'count': len(sondes),
                     'total_frames': self.total_frames_received,
                     'total_sondes': self.total_sondes_received,
+                    'today_frames': self._get_today_frames(),
                     'timestamp': datetime.utcnow().isoformat() + 'Z'
                 })
-        
+
+        @self.app.route('/api/gateway')
+        def get_gateway():
+            """Gateway self-info for the map's own-station marker popup:
+            identity/hardware (like MQTT.openwx.de) plus the sondes this gateway
+            received in the last hour with great-circle distance from the station.
+            """
+            station_cfg = self.config.get('station', {})
+            lat = station_cfg.get('lat')
+            lon = station_cfg.get('lon')
+            alt = station_cfg.get('alt', 0)
+            with self.lock:
+                active = len([s for s in self.sondes if self._is_valid_serial(s)])
+                total_frames = self.total_frames_received
+            return jsonify({
+                'name': station_cfg.get('callsign', '') or 'Gateway',
+                'status': 'online',
+                'receiver': station_cfg.get('receiver', 'Unknown'),
+                'antenna': station_cfg.get('antenna', 'Unknown'),
+                'hardware': detect_host_hardware(),
+                'version': f"OpenWXSDR V{__version__}",
+                'lat': lat,
+                'lon': lon,
+                'alt': alt,
+                'active_sondes': active,
+                'total_frames': total_frames,
+                'recent_window_s': int(self.sonde_retention_time),
+                'recent_sondes': self._recent_sondes(lat, lon, alt, self.sonde_retention_time),
+                'timestamp': datetime.utcnow().isoformat() + 'Z'
+            })
+
+        @self.app.route('/api/landings')
+        def get_landings():
+            """Landing (last-known) position of every sonde in the logs, with the
+            metadata for the map markers/heatmap and the great-circle distance
+            from the station (for the 25/50/100 km range rings). One entry per
+            serial (the most recent log wins)."""
+            station_cfg = self.config.get('station', {})
+            slat = station_cfg.get('lat')
+            slon = station_cfg.get('lon')
+            log_dir = 'data/logs'
+            seen: Dict[str, dict] = {}
+            if os.path.isdir(log_dir):
+                name_re = re.compile(r'^(.+?)-(\d{8})-(\d{6})\.log$')
+                for fn in sorted(os.listdir(log_dir)):
+                    m = name_re.match(fn)
+                    if not m:
+                        continue
+                    serial = m.group(1)
+                    info = self._landing_from_log(os.path.join(log_dir, fn))
+                    if not info or info.get('lat') is None:
+                        continue
+                    entry = {
+                        'serial': serial,
+                        'type': info.get('type'),
+                        'frequency': info.get('frequency'),
+                        'timestamp': info.get('timestamp'),
+                        'lat': info['lat'],
+                        'lon': info['lon'],
+                        'alt': info.get('alt'),
+                        'vvel': info.get('vvel'),
+                        'distance_km': self._haversine_km(slat, slon, info['lat'], info['lon']),
+                        'filename': fn,   # lets the map load this sonde's full path
+                    }
+                    # sorted() ascending → later filenames (newer) overwrite.
+                    seen[serial] = entry
+            return jsonify({
+                'station': {'lat': slat, 'lon': slon},
+                'landings': list(seen.values()),
+                'count': len(seen),
+            })
+
         @self.app.route('/api/sonde/<serial>')
         def get_sonde(serial):
             """Get telemetry for specific sonde"""
@@ -302,11 +379,24 @@ class WebUI:
                     }), 404
                 
                 # Extract relevant fields for charting
+                _st = self.config.get('station', {})
                 frames = []
                 for point in data:
                     if not point.get('timestamp'):
                         continue
-                    
+
+                    # Elevation angle + slant distance from the station to this
+                    # fix (for the Elevation graph's second line).
+                    elev = None
+                    dist = None
+                    if point.get('lat') is not None:
+                        _look = self._look_angles(
+                            _st.get('lat'), _st.get('lon'), _st.get('alt', 0),
+                            point.get('lat'), point.get('lon'), point.get('alt'))
+                        if _look:
+                            elev = round(_look['elevation_deg'], 1)
+                            dist = round(_look['slant_km'], 2)
+
                     frame = {
                         'timestamp': point['timestamp'],
                         'alt': point.get('alt'),
@@ -315,18 +405,26 @@ class WebUI:
                         'rssi': point.get('rssi'),
                         'snr': point.get('snr'),
                         'sats': point.get('sats'),
-                        'battery': point.get('batt')  # API uses 'batt' key, charts expect 'battery'
+                        'battery': point.get('batt'),  # API uses 'batt' key, charts expect 'battery'
+                        'elevation': elev,
+                        'distance': dist,
+                        'frequency': point.get('frequency')  # for the stats header (right-click path)
                     }
-                    
+
                     # Only include frames with at least some data
                     if any(v is not None for k, v in frame.items() if k != 'timestamp'):
                         frames.append(frame)
-                
-                return jsonify({
-                    'serial': serial,
-                    'frames': frames,
-                    'count': len(frames)
-                })
+
+            # LTTB decimation for fast charts (outside the lock — pure CPU).
+            max_points = request.args.get('max_points', default=1000, type=int)
+            total = len(frames)
+            frames = self._decimate_frames(frames, max_points)
+            return jsonify({
+                'serial': serial,
+                'frames': frames,
+                'count': len(frames),
+                'total_frames': total
+            })
         
         @self.app.route('/api/status')
         def get_status():
@@ -426,6 +524,7 @@ class WebUI:
                     },
                     'mqtt': self._get_mqtt_health(),
                     'sondehub': self._get_sondehub_health(),
+                    'ephemeris': self._get_ephemeris_health(),
                     'last_frame_time': last_frame_time,
                     'timestamp': datetime.utcnow().isoformat() + 'Z'
                 })
@@ -709,6 +808,8 @@ class WebUI:
                     self.sondes.clear()
                     self.total_frames_received = 0
                     self.total_sondes_received = 0
+                    self._today_frames = 0
+                    self._today_frames_date = datetime.utcnow().strftime('%Y-%m-%d')
                     self.active_frequencies.clear()
 
                 self.logger.info("System statistics reset requested from Web UI")
@@ -1974,6 +2075,16 @@ class WebUI:
                 self.logger.error(f"Error controlling service: {e}")
                 return jsonify({'success': False, 'error': str(e)})
 
+        @self.app.route('/api/system_config_check')
+        def get_system_config_check():
+            """Aggregated installation / configuration diagnostics for the
+            'System configuration' modal (install + softchain + config state)."""
+            try:
+                return jsonify({'success': True, **self._system_config_check()})
+            except Exception as e:
+                self.logger.error(f"Error in system_config_check: {e}", exc_info=True)
+                return jsonify({'success': False, 'error': str(e)})
+
         @self.app.route('/api/logfiles')
         def get_logfiles():
             """Get list of log files"""
@@ -1986,7 +2097,17 @@ class WebUI:
                     [f for f in os.listdir(log_dir) if f.endswith('.log') or f.endswith('.txt')],
                     reverse=True
                 )
-                return jsonify({'files': files})
+                # Authoritative per-file sonde type (header + resolved subtype),
+                # so the UI shows the correct type (incl. DFM17 etc.) instead of
+                # guessing from the serial. Only for sonde logs (skip activity).
+                types = {}
+                for fn in files:
+                    if fn.startswith('openwxsdr_') or not fn.endswith('.log'):
+                        continue
+                    t = self._logfile_type(os.path.join(log_dir, fn))
+                    if t:
+                        types[fn] = t
+                return jsonify({'files': files, 'types': types})
             except Exception as e:
                 self.logger.error(f"Error listing logfiles: {e}")
                 return jsonify({'files': [], 'error': str(e)})
@@ -2065,6 +2186,14 @@ class WebUI:
                         except:
                             pass
                     
+                    elif line.startswith('Elevation:'):
+                        # Elevation: 12.3°  (gateway->sonde look angle)
+                        try:
+                            el_str = line.split(':', 1)[1].strip().replace('°', '')
+                            current_frame['elevation'] = float(el_str)
+                        except (ValueError, IndexError):
+                            pass
+
                     elif line.startswith('Altitude:'):
                         # Altitude: 12345.0 m
                         try:
@@ -2128,6 +2257,7 @@ class WebUI:
                     frames.append(current_frame)
                 
                 # Ensure all frames have the expected fields (with None if missing)
+                _st = self.config.get('station', {})
                 for frame in frames:
                     frame.setdefault('alt', None)
                     frame.setdefault('vel_v', None)
@@ -2136,12 +2266,31 @@ class WebUI:
                     frame.setdefault('snr', None)
                     frame.setdefault('sats', None)
                     frame.setdefault('battery', None)
+                    # Elevation (prefer the logged value; compute for older logs)
+                    # + slant distance for the Elevation graph's second line.
+                    if frame.get('lat') is not None:
+                        _look = self._look_angles(
+                            _st.get('lat'), _st.get('lon'), _st.get('alt', 0),
+                            frame.get('lat'), frame.get('lon'), frame.get('alt'))
+                        if _look:
+                            if frame.get('elevation') is None:
+                                frame['elevation'] = round(_look['elevation_deg'], 1)
+                            frame['distance'] = round(_look['slant_km'], 2)
+                    frame.setdefault('elevation', None)
+                    frame.setdefault('distance', None)
                 
+                # Server-side LTTB decimation for fast charts (default ~1000 pts,
+                # override with ?max_points=; 0 = no decimation).
+                max_points = request.args.get('max_points', default=1000, type=int)
+                total = len(frames)
+                frames = self._decimate_frames(frames, max_points)
                 return jsonify({
                     'serial': serial,
                     'filename': filename,
+                    'sonde_type': self._logfile_type(filepath),
                     'frames': frames,
-                    'count': len(frames)
+                    'count': len(frames),
+                    'total_frames': total
                 })
                 
             except Exception as e:
@@ -2890,6 +3039,398 @@ class WebUI:
 
         return {'status': 'unknown'}
 
+    def _get_ephemeris_health(self) -> dict:
+        """RS92 GPS-ephemeris download status for the System Health panel."""
+        try:
+            from ..sdr.ephemeris import status as _ephem_status
+            return _ephem_status()
+        except Exception:
+            return {'enabled': False, 'available': False, 'state': 'disabled'}
+
+    # ------------------------------------------------------------------ #
+    #  System configuration diagnostics (System configuration modal)     #
+    # ------------------------------------------------------------------ #
+    def _bin_runs(self, path: str) -> bool:
+        """True if an executable at `path` runs and emits any usage/help output
+        (the field-broken dft_detect binary printed nothing at all)."""
+        try:
+            for args in (['--help'], []):
+                r = subprocess.run([path] + args, capture_output=True,
+                                   text=True, timeout=6)
+                if (r.stdout or '') + (r.stderr or ''):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _decoder_dir(self) -> str:
+        cfg = (self.config.get('decoders', {}) or {})
+        d = str(cfg.get('rs1729_path') or './decoders/rs1729')
+        return os.path.abspath(os.path.join(os.getcwd(), d))
+
+    def _system_config_check(self) -> dict:
+        """Collect the installation/config checks shown in the modal. Each entry
+        is {label, status: ok|warn|fail|info, detail}. Never raises per-check —
+        a failed probe becomes a 'warn'/'fail' row, not a 500."""
+        cfg = self.config or {}
+        dec_dir = self._decoder_dir()
+
+        def entry(label, status, detail, kind=None, dot=None, sonde=None):
+            e = {'label': label, 'status': status, 'detail': detail}
+            if kind:
+                e['kind'] = kind
+            if dot:
+                e['dot'] = dot
+            if sonde:
+                e['sonde'] = sonde
+            return e
+
+        g_install, g_config, g_upload = [], [], []
+
+        # =====================================================================
+        #  GROUP 1 — INSTALLATION
+        # =====================================================================
+        cfg_file = os.path.abspath(os.path.join(os.getcwd(), 'config.yaml'))
+        have_cfg = os.path.isfile(cfg_file)
+        have_decdir = os.path.isdir(dec_dir)
+        in_venv = (sys.prefix != getattr(sys, 'base_prefix', sys.prefix))
+        venv_dir = os.path.abspath(os.path.join(os.getcwd(), 'venv'))
+        have_venv = in_venv or os.path.isdir(venv_dir)
+        install_ok = have_cfg and have_decdir and have_venv
+        g_install.append(entry(
+            'Installation completed', 'ok' if install_ok else 'warn',
+            'config.yaml, decoders/rs1729 and Python venv present'
+            if install_ok else
+            f"missing: {', '.join(x for x, ok in (('config.yaml', have_cfg), ('decoders/rs1729', have_decdir), ('venv', have_venv)) if not ok)}"))
+
+        # install_softchain executed? (its binaries present + run)
+        dft = os.path.join(dec_dir, 'dft_detect')
+        fsk = os.path.join(dec_dir, 'fsk_demod')
+        rs41 = os.path.join(dec_dir, 'rs41mod')
+        dft_ok = os.path.isfile(dft) and self._bin_runs(dft)
+        fsk_ok = os.path.isfile(fsk) and self._bin_runs(fsk)
+        softchain_ok = dft_ok and fsk_ok
+        g_install.append(entry(
+            'install_softchain executed',
+            'ok' if softchain_ok else ('warn' if (os.path.isfile(dft) or os.path.isfile(fsk)) else 'fail'),
+            f"binaries in {os.path.relpath(dec_dir, os.getcwd())}"
+            if softchain_ok else 'run scripts/install_softchain.sh'))
+        g_install.append(entry(
+            '  └ dft_detect', 'ok' if dft_ok else ('warn' if os.path.isfile(dft) else 'fail'),
+            'runs and produces output' if dft_ok else
+            ('present but no output (rebuild)' if os.path.isfile(dft) else 'not installed')))
+        g_install.append(entry(
+            '  └ fsk_demod', 'ok' if fsk_ok else ('warn' if os.path.isfile(fsk) else 'fail'),
+            'runs and prints usage' if fsk_ok else
+            ('present but no output (rebuild)' if os.path.isfile(fsk) else 'not installed')))
+        softin = False
+        if os.path.isfile(rs41):
+            try:
+                r = subprocess.run([rs41, '--help'], capture_output=True, text=True, timeout=6)
+                softin = '--softin' in ((r.stdout or '') + (r.stderr or ''))
+            except Exception:
+                softin = False
+        g_install.append(entry(
+            '  └ softin support', 'ok' if softin else ('warn' if os.path.isfile(rs41) else 'fail'),
+            'rs41mod accepts --softin (soft-bit chain usable)' if softin else
+            ('rs41mod present but no --softin (old build)' if os.path.isfile(rs41) else 'rs41mod not installed')))
+
+        # Python venv
+        g_install.append(entry(
+            'Python venv', 'ok' if have_venv else 'warn',
+            f"running in venv ({sys.prefix})" if in_venv else
+            (f"venv dir present ({os.path.relpath(venv_dir, os.getcwd())})" if os.path.isdir(venv_dir) else 'no venv detected')))
+
+        # MQTT client library
+        try:
+            import paho.mqtt  # noqa: F401
+            paho_ver = getattr(__import__('paho.mqtt', fromlist=['__version__']), '__version__', '?')
+            g_install.append(entry('MQTT client library', 'ok', f"paho-mqtt {paho_ver} installed"))
+        except Exception:
+            g_install.append(entry('MQTT client library', 'warn', 'paho-mqtt not installed (pip install paho-mqtt)'))
+
+        # config.yaml valid (parses)
+        cfg_status, cfg_detail = 'ok', f"parsed OK ({os.path.relpath(cfg_file, os.getcwd())})"
+        try:
+            import yaml
+            if have_cfg:
+                with open(cfg_file, 'r', encoding='utf-8') as f:
+                    yaml.safe_load(f)
+            else:
+                cfg_status, cfg_detail = 'warn', 'config.yaml not found in working directory'
+        except Exception as e:
+            cfg_status, cfg_detail = 'fail', f"YAML parse error: {e}"
+        g_install.append(entry('config.yaml valid', cfg_status, cfg_detail))
+
+        # Airspy support (install-time SDR capability)
+        airspy_cfg = bool((cfg.get('sdr', {}) or {}).get('airspy_support', False))
+        airspy_bin = shutil.which('airspy_rx') is not None
+        g_install.append(entry(
+            'Airspy support',
+            'ok' if (airspy_cfg and airspy_bin) else ('warn' if (airspy_cfg or airspy_bin) else 'info'),
+            f"sdr.airspy_support={airspy_cfg}; airspy_rx {'found' if airspy_bin else 'not found'} in PATH"))
+
+        # =====================================================================
+        #  GROUP 2 — CONFIGURATION
+        # =====================================================================
+        sdr = (cfg.get('sdr', {}) or {})
+        sdr_type = str(sdr.get('type', 'rtlsdr'))
+        det = (cfg.get('detection', {}) or {})
+
+        # Per-device live worker status (state + decoded sonde + active freq).
+        ws_map = {}
+        dm = getattr(self, 'decoder_manager', None)
+        if dm is not None and hasattr(dm, 'get_worker_status'):
+            try:
+                for ws in dm.get_worker_status():
+                    ws_map[ws.get('serial')] = ws
+            except Exception:
+                pass
+        connected = None
+        if sdr_type == 'rtlsdr':
+            try:
+                connected = self._get_connected_rtlsdr_serials()
+            except Exception:
+                connected = None
+
+        def _recv_row(serial, center_hz, mode):
+            """Build a receiver entry with a colored status dot + decoded sonde,
+            mirroring the SDR Devices panel."""
+            ws = ws_map.get(serial) or {}
+            state = ws.get('state')
+            sonde = ws.get('sonde_type')
+            present = (serial in connected) if connected is not None else True
+            # Active-decode frequency label if we have one, else configured center.
+            flabel = ws.get('freq_label')
+            if not flabel and ws.get('frequency'):
+                flabel = f"{ws['frequency']/1e6:.3f} MHz"
+            if not flabel:
+                flabel = f"{center_hz/1e6:.3f} MHz"
+            if state == 'decoding':
+                dot, st, sd = 'green', 'ok', 'decoding'
+            elif state == 'scanning':
+                dot, st, sd = 'blue', 'ok', 'scanning'
+            elif state == 'idle':
+                dot, st, sd = 'grey', 'info', 'idle'
+            elif not present:
+                dot, st, sd = 'red', 'warn', 'not detected'
+            else:
+                dot, st, sd = 'green', 'ok', 'connected'
+            if state == 'decoding' and sonde:
+                detail = f"{flabel} · {sonde} · {sd}"
+            else:
+                detail = f"{flabel} · {mode} · {sd}"
+            return entry(f"  • {serial}", st, detail, kind='receiver', dot=dot,
+                         sonde=(sonde if state == 'decoding' else None))
+
+        recv_rows = []
+        if sdr_type == 'rtlsdr':
+            for d in ((sdr.get('rtlsdr', {}) or {}).get('devices', []) or []):
+                recv_rows.append(_recv_row(str(d.get('serial', '?')),
+                                           int(d.get('center_freq', 0)),
+                                           d.get('decoder_mode', 'legacy')))
+        elif sdr_type == 'airspy':
+            a = (sdr.get('airspy', {}) or {})
+            recv_rows.append(_recv_row(f"Airspy {a.get('serial') or '(auto)'}",
+                                       int(a.get('center_freq', 0)),
+                                       a.get('decode_mode', 'legacy')))
+        elif sdr_type == 'ka9q':
+            k = (sdr.get('ka9q', {}) or {})
+            recv_rows.append(entry(
+                f"  • KA9Q {k.get('radio_hostname', '?')}", 'ok',
+                f"grp {k.get('multicast_group', '?')}:{k.get('port', '?')} · max {k.get('max_channels', '?')} ch",
+                kind='receiver', dot='green'))
+        elif sdr_type == 'flux242':
+            fx = (sdr.get('flux242', {}) or {})
+            recv_rows.append(entry("  • Flux242", 'ok',
+                                   f"{int(fx.get('center_freq', 0))/1e6:.3f} MHz",
+                                   kind='receiver', dot='green'))
+
+        g_config.append(entry(f"Configured receivers ({sdr_type})",
+                              'ok' if recv_rows else 'warn',
+                              f"{len(recv_rows)} configured" if recv_rows else 'none configured'))
+        g_config.extend(recv_rows)
+
+        # Scanner mode / status (+ scan frequency range)
+        scanner = (det.get('scanner', {}) or {})
+        backend = str(scanner.get('backend', 'welch')).lower()
+        if backend == 'rtl_power':
+            lo, hi = scanner.get('band_start_hz'), scanner.get('band_stop_hz')
+        else:
+            fr = det.get('freq_ranges') or []
+            lo = min((r[0] for r in fr if len(r) >= 2), default=None)
+            hi = max((r[1] for r in fr if len(r) >= 2), default=None)
+        rng = f" · range {lo/1e6:.2f} - {hi/1e6:.2f} MHz" if (lo and hi) else ''
+        if backend == 'rtl_power':
+            rp = str(scanner.get('rtl_power_path', 'rtl_power'))
+            have_rp = shutil.which(rp) is not None
+            g_config.append(entry(
+                'Scanner mode', 'ok' if have_rp else 'warn',
+                ('rtl_power full-band sweep' if have_rp
+                 else f"rtl_power set but '{rp}' not found — falls back to welch") + rng))
+        else:
+            g_config.append(entry('Scanner mode', 'ok', 'welch per-device segment scan' + rng))
+        if sdr_type == 'ka9q':
+            sm = bool((sdr.get('ka9q', {}) or {}).get('scanning_mode', False))
+            g_config.append(entry('  • KA9Q scanning', 'ok' if sm else 'info',
+                                  'DFT spectrum scanning enabled' if sm else 'disabled (static channels)'))
+
+        # Band sweep
+        bs = (det.get('band_sweep', {}) or {})
+        bs_on = bool(bs.get('enabled', False))
+        if bs_on:
+            bs_detail = (f"enabled {bs.get('band_min_hz', 0)/1e6:.1f}-{bs.get('band_max_hz', 0)/1e6:.1f} MHz, "
+                         f"hop after {bs.get('dwell_empty_cycles', '?')} empty scans")
+            if backend == 'rtl_power':
+                bs_detail += ' (ignored in rtl_power mode)'
+        else:
+            bs_detail = 'disabled (static center per device)'
+        g_config.append(entry('Band sweep', 'ok' if bs_on else 'info', bs_detail))
+
+        # Supported sonde types
+        try:
+            from ..decoders.rs1729_decoder import RS1729Decoder
+            type_map = RS1729Decoder.DECODER_MAP
+        except Exception:
+            type_map = {'RS41': 'rs41mod', 'RS92': 'rs92mod', 'DFM': 'dfm09mod',
+                        'M10': 'm10mod', 'M20': 'm20mod', 'iMet': 'imet54mod',
+                        'LMS6': 'lms6mod', 'MRZ': 'mrzmod'}
+        present = [t for t, b in type_map.items() if os.path.isfile(os.path.join(dec_dir, b))]
+        g_config.append(entry(
+            'Supported sonde types',
+            'ok' if present else 'warn',
+            f"decoders present: {', '.join(present)}" if present else
+            f"none of {', '.join(type_map)} found in {os.path.relpath(dec_dir, os.getcwd())}"))
+
+        # soft_decode
+        soft_on = bool((cfg.get('decoders', {}) or {}).get('soft_decode', False))
+        if soft_on:
+            usable = fsk_ok and softin
+            g_config.append(entry(
+                'soft_decode', 'ok' if usable else 'warn',
+                'ON — fsk_demod soft-bit chain' if usable else
+                'ON but fsk_demod/softin missing → falls back to direct --IQ'))
+        else:
+            g_config.append(entry('soft_decode', 'info', 'OFF — direct --IQ decode chain (default)'))
+
+        # USB recovery
+        rec = (cfg.get('recovery', {}) or {})
+        usb_on = bool(rec.get('usb_reset_on_wedge', False))
+        g_config.append(entry(
+            'USB recovery', 'ok' if usb_on else 'info',
+            (f"reset-on-wedge on (settle {rec.get('usb_reset_settle_s', '?')}s, "
+             f"max {rec.get('usb_reset_max_attempts', '?')} attempts)")
+            if usb_on else 'reset-on-wedge off'))
+
+        # SNR live values
+        live_snr = bool((cfg.get('decoders', {}) or {}).get('live_signal_metrics', False))
+        airspy_active = (sdr_type == 'airspy')
+        g_config.append(entry(
+            'SNR live values',
+            'ok' if (live_snr or airspy_active) else 'info',
+            'active (decoders.live_signal_metrics: true)' if live_snr else
+            ('active (Airspy provides per-frame RSSI/SNR)' if airspy_active else
+             'off (decoders.live_signal_metrics: false — one-time scan value)')))
+
+        # RS41 fallback (full dft_detect classification)
+        fastpath = bool(det.get('rs41_fastpath', False))
+        g_config.append(entry(
+            'RS41 fallback (full dft_detect)',
+            'ok' if not fastpath else 'info',
+            'ACTIVE — every candidate classified by dft_detect (rs41_fastpath: false)'
+            if not fastpath else 'INACTIVE — rs41_fastpath: true (bandwidth fast-path in use)'))
+
+        # Sonde retention on map
+        retention = (cfg.get('webui', {}) or {}).get('sonde_retention_time',
+                     (cfg.get('output', {}) or {}).get('sonde_retention_time'))
+        if retention is None:
+            g_config.append(entry('Sonde retention time', 'info', 'not set (default)'))
+        else:
+            try:
+                secs = int(retention)
+                g_config.append(entry('Sonde retention time', 'ok',
+                                      f"{secs} s ({secs/3600:.1f} h) kept on map after last frame"))
+            except (TypeError, ValueError):
+                g_config.append(entry('Sonde retention time', 'warn', f"invalid value: {retention!r}"))
+
+        # =====================================================================
+        #  GROUP 3 — UPLOAD / DOWNLOAD
+        # =====================================================================
+        # UDP JSON output
+        udp = ((cfg.get('output', {}) or {}).get('udp', {}) or {})
+        udp_on = bool(udp.get('enabled', False))
+        g_upload.append(entry(
+            'UDP output', 'ok' if udp_on else 'info',
+            f"enabled → {udp.get('host', '127.0.0.1')}:{udp.get('port', '?')} (JSON)"
+            if udp_on else 'disabled'))
+
+        # MQTT upload
+        mqtt_cfg = ((cfg.get('openwx', {}) or {}).get('mqtt', {}) or {})
+        mqtt_enabled = bool(mqtt_cfg.get('enabled', False))
+        mqtt_server = str(mqtt_cfg.get('server', '') or '')
+        mqtt_port = mqtt_cfg.get('port', '')
+        mqtt_state = self._get_mqtt_health().get('status', 'unknown')
+        mqtt_target = f", server {mqtt_server}:{mqtt_port}" if mqtt_server else ''
+        g_upload.append(entry(
+            'MQTT upload',
+            'ok' if (mqtt_enabled and mqtt_state in ('connected', 'ok', 'running')) else ('info' if not mqtt_enabled else 'warn'),
+            f"enabled={mqtt_enabled}, status={mqtt_state}{mqtt_target}"))
+
+        # SondeHub upload
+        sh_enabled = bool((cfg.get('sondehub', {}) or {}).get('enabled', False))
+        sh_state = self._get_sondehub_health().get('status', 'unknown')
+        g_upload.append(entry(
+            'SondeHub upload',
+            'ok' if (sh_enabled and sh_state in ('connected', 'ok', 'running', 'active', 'uploading')) else ('info' if not sh_enabled else 'warn'),
+            f"enabled={sh_enabled}, status={sh_state}"))
+
+        # RS92 ephemeris
+        eph = self._get_ephemeris_health()
+        if not eph.get('enabled'):
+            g_upload.append(entry('RS92 ephemeris', 'info', 'download disabled (rs92.ephemeris_download: false)'))
+        else:
+            g_upload.append(entry(
+                'RS92 ephemeris',
+                'ok' if eph.get('available') else 'warn',
+                f"{eph.get('state', '?')}" + (f" — {eph.get('file')}" if eph.get('file') else '')))
+
+        # Telemetry (anonymous install counter) — shows the current install ID
+        tel = (cfg.get('telemetry', {}) or {})
+        tel_on = bool(tel.get('enabled', False))
+        if tel_on:
+            install_id = ''
+            try:
+                iid_path = os.path.join(os.getcwd(), 'data', '.install_id')
+                if os.path.isfile(iid_path):
+                    with open(iid_path, 'r', encoding='utf-8') as f:
+                        install_id = f.read().strip()
+            except Exception:
+                install_id = ''
+            tel_detail = f"enabled — install ID {install_id}" if install_id else \
+                'enabled — install ID not yet generated'
+        else:
+            tel_detail = 'disabled (no anonymous install counter)'
+        g_upload.append(entry('Telemetry (install counter)',
+                              'ok' if tel_on else 'info', tel_detail))
+
+        groups = [
+            {'name': 'Installation', 'checks': g_install},
+            {'name': 'Configuration', 'checks': g_config},
+            {'name': 'Upload / Download', 'checks': g_upload},
+        ]
+        checks = [c for g in groups for c in g['checks']]
+        ok = sum(1 for c in checks if c['status'] == 'ok')
+        warn = sum(1 for c in checks if c['status'] == 'warn')
+        fail = sum(1 for c in checks if c['status'] == 'fail')
+        return {
+            'groups': groups,
+            'checks': checks,   # flat list kept for backward compatibility
+            'summary': {'ok': ok, 'warn': warn, 'fail': fail, 'total': len(checks)},
+            'version': __version__,
+            'station': str((cfg.get('station', {}) or {}).get('callsign', '') or ''),
+            'generated': datetime.utcnow().isoformat() + 'Z',
+        }
+
     def _get_connected_rtlsdr_serials(self) -> Set[str]:
         """Return set of serial numbers for physically connected RTL-SDR devices.
         Result is cached for 10 seconds to avoid hammering rtl_test."""
@@ -3046,12 +3587,342 @@ class WebUI:
         
         return sondes
     
+    def _get_today_frames(self) -> int:
+        """Frames received on the current UTC day, rolling over at UTC midnight.
+        Rolls the counter here too so a quiet gateway still reports 0 (not
+        yesterday's total) once the day changes without a new frame arriving."""
+        today = datetime.utcnow().strftime('%Y-%m-%d')
+        if today != self._today_frames_date:
+            self._today_frames_date = today
+            self._today_frames = 0
+        return self._today_frames
+
+    @staticmethod
+    def _haversine_km(lat1, lon1, lat2, lon2) -> Optional[float]:
+        """Great-circle (surface) distance in km, or None if a coord is missing."""
+        try:
+            lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
+        except (TypeError, ValueError):
+            return None
+        r = 6371.0
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlmb = math.radians(lon2 - lon1)
+        a = (math.sin(dphi / 2) ** 2 +
+             math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2)
+        return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    @staticmethod
+    def _look_angles(gw_lat, gw_lon, gw_alt, s_lat, s_lon, s_alt) -> Optional[dict]:
+        """Gateway->sonde look geometry using a spherical-earth ENU conversion
+        that accounts for BOTH altitudes. Returns a dict or None if lat/lon are
+        missing:
+          slant_km      true 3D line-of-sight distance (height-aware)
+          ground_km     great-circle surface distance
+          elevation_deg angle above the local horizon (negative = below horizon,
+                        i.e. hidden by earth curvature)
+          azimuth_deg   compass bearing 0..360 (0=N, 90=E, 180=S, 270=W)
+        Missing altitudes default to 0 m so a fix still yields a bearing.
+        """
+        try:
+            gw_lat = float(gw_lat); gw_lon = float(gw_lon)
+            s_lat = float(s_lat);   s_lon = float(s_lon)
+        except (TypeError, ValueError):
+            return None
+        try:
+            gw_h = float(gw_alt)
+        except (TypeError, ValueError):
+            gw_h = 0.0
+        try:
+            s_h = float(s_alt)
+        except (TypeError, ValueError):
+            s_h = 0.0
+
+        R = 6371000.0  # mean earth radius (m)
+
+        def ecef(lat, lon, h):
+            la, lo, r = math.radians(lat), math.radians(lon), R + h
+            return (r * math.cos(la) * math.cos(lo),
+                    r * math.cos(la) * math.sin(lo),
+                    r * math.sin(la))
+
+        gx, gy, gz = ecef(gw_lat, gw_lon, gw_h)
+        sx, sy, sz = ecef(s_lat, s_lon, s_h)
+        dx, dy, dz = sx - gx, sy - gy, sz - gz
+
+        la, lo = math.radians(gw_lat), math.radians(gw_lon)
+        east  = (-math.sin(lo), math.cos(lo), 0.0)
+        north = (-math.sin(la) * math.cos(lo), -math.sin(la) * math.sin(lo), math.cos(la))
+        up    = (math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la))
+
+        e = dx * east[0]  + dy * east[1]  + dz * east[2]
+        n = dx * north[0] + dy * north[1] + dz * north[2]
+        u = dx * up[0]    + dy * up[1]    + dz * up[2]
+
+        horiz = math.hypot(e, n)
+        slant = math.sqrt(e * e + n * n + u * u)
+        elevation = math.degrees(math.atan2(u, horiz)) if slant > 0 else 0.0
+        azimuth = (math.degrees(math.atan2(e, n)) + 360.0) % 360.0
+
+        return {
+            'slant_km': slant / 1000.0,
+            'ground_km': WebUI._haversine_km(gw_lat, gw_lon, s_lat, s_lon),
+            'elevation_deg': elevation,
+            'azimuth_deg': azimuth,
+        }
+
+    @staticmethod
+    def _decimate_frames(frames: List[dict], max_points: int,
+                         shape_key: str = 'alt') -> List[dict]:
+        """Downsample statistics frames to ~max_points using LTTB (Largest-
+        Triangle-Three-Buckets) on `shape_key`. LTTB keeps the visually
+        important points (burst, landing, spikes) instead of blindly striding,
+        and selects ONE shared index set so every series keeps a common time
+        axis. Returns frames unchanged when already small enough."""
+        n = len(frames)
+        if not max_points or max_points < 3 or n <= max_points:
+            return frames
+
+        # Build the shape series; fall back to another numeric field if `alt`
+        # is entirely missing (e.g. a log with no positions).
+        def _num(fr, k):
+            v = fr.get(k)
+            return float(v) if isinstance(v, (int, float)) else None
+        ys = [_num(f, shape_key) for f in frames]
+        if all(v is None for v in ys):
+            for k in ('rssi', 'snr', 'vel_v', 'vel_h', 'sats', 'battery', 'elevation'):
+                cand = [_num(f, k) for f in frames]
+                if any(v is not None for v in cand):
+                    ys = cand
+                    break
+        # Forward-fill None so triangle areas are computable.
+        last = 0.0
+        filled = []
+        for v in ys:
+            if v is None:
+                v = last
+            else:
+                last = v
+            filled.append(v)
+        ys = filled
+
+        sampled = [0]                       # always keep the first point
+        every = (n - 2) / (max_points - 2)
+        a = 0
+        for i in range(max_points - 2):
+            avg_start = int((i + 1) * every) + 1
+            avg_end = min(int((i + 2) * every) + 1, n)
+            if avg_end <= avg_start:
+                avg_end = min(avg_start + 1, n)
+            avg_x = (avg_start + avg_end - 1) / 2.0
+            avg_y = sum(ys[avg_start:avg_end]) / (avg_end - avg_start)
+            rng_start = int(i * every) + 1
+            rng_end = min(int((i + 1) * every) + 1, n)
+            ay = ys[a]
+            best_area = -1.0
+            best_idx = rng_start
+            for j in range(rng_start, rng_end):
+                area = abs((a - avg_x) * (ys[j] - ay) - (a - j) * (avg_y - ay))
+                if area > best_area:
+                    best_area = area
+                    best_idx = j
+            sampled.append(best_idx)
+            a = best_idx
+        sampled.append(n - 1)               # always keep the last point
+        return [frames[i] for i in sampled]
+
+    def _recent_sondes(self, station_lat, station_lon, station_alt=0, window_s=3600) -> List[dict]:
+        """Sondes this gateway received within the last `window_s` seconds, newest
+        first (window comes from webui.sonde_retention_time — the "stale" horizon).
+
+        Scans data/logs/<serial>-YYYYMMDD-HHMMSS.log, keeps files touched within
+        the window (file mtime = last frame written), and reads the tail for the
+        last known position + altitude + type so we can show the height-aware
+        slant distance, elevation angle and bearing (course) from the station.
+        One entry per serial (most recently active file wins).
+        """
+        results: Dict[str, dict] = {}
+        log_dir = 'data/logs'
+        if not os.path.isdir(log_dir):
+            return []
+        cutoff = time.time() - max(60, int(window_s))
+        name_re = re.compile(r'^(.+?)-(\d{8})-(\d{6})\.log$')
+        for fname in os.listdir(log_dir):
+            m = name_re.match(fname)
+            if not m:
+                continue
+            path = os.path.join(log_dir, fname)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            serial = m.group(1)
+            # Keep only the most recently active file per serial.
+            if serial in results and results[serial]['_mtime'] >= mtime:
+                continue
+            info = self._tail_last_position(path)
+            lat = info.get('lat')
+            lon = info.get('lon')
+            look = self._look_angles(station_lat, station_lon, station_alt,
+                                     lat, lon, info.get('alt'))
+            results[serial] = {
+                '_mtime': mtime,
+                'serial': serial,
+                'type': info.get('type'),
+                'lat': lat,
+                'lon': lon,
+                'alt': info.get('alt'),
+                'battery': info.get('battery'),
+                'filename': fname,   # lets the popup load this sonde's history
+                'last_seen': datetime.utcfromtimestamp(mtime).isoformat() + 'Z',
+                # distance_km is now the height-aware 3D slant range.
+                'distance_km': look['slant_km'] if look else None,
+                'ground_km': look['ground_km'] if look else None,
+                'elevation_deg': look['elevation_deg'] if look else None,
+                'azimuth_deg': look['azimuth_deg'] if look else None,
+            }
+        out = sorted(results.values(), key=lambda r: r['_mtime'], reverse=True)
+        for r in out:
+            r.pop('_mtime', None)
+        return out
+
+    @staticmethod
+    def _tail_last_position(path: str, max_bytes: int = 65536) -> dict:
+        """Read the tail of a sonde log and return the last position/alt + type.
+        Log blocks use lines like 'Position: <lat>, <lon>' and 'Altitude: <a> m';
+        the header line 'Sonde: <serial> (<type>)' carries the type."""
+        info: dict = {'lat': None, 'lon': None, 'alt': None, 'type': None,
+                      'battery': None}
+        try:
+            with open(path, 'r', errors='ignore') as f:
+                head = f.readline() + f.readline() + f.readline()
+                mt = re.search(r'\(([^)]+)\)', head)
+                if mt:
+                    info['type'] = mt.group(1).strip()
+                try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - max_bytes))
+                except (OSError, ValueError):
+                    f.seek(0)
+                tail = f.read()
+        except OSError:
+            return info
+        for pm in re.finditer(r'Position:\s*([+-]?\d+\.\d+),\s*([+-]?\d+\.\d+)', tail):
+            try:
+                info['lat'] = float(pm.group(1))
+                info['lon'] = float(pm.group(2))
+            except ValueError:
+                pass
+        for am in re.finditer(r'Altitude:\s*([+-]?\d+(?:\.\d+)?)\s*m', tail):
+            try:
+                info['alt'] = float(am.group(1))
+            except ValueError:
+                pass
+        for bm in re.finditer(r'Battery:\s*([+-]?\d+(?:\.\d+)?)\s*V', tail):
+            try:
+                info['battery'] = float(bm.group(1))
+            except ValueError:
+                pass
+        # Prefer the most specific per-frame 'Type:' line (e.g. DFM17) for the label.
+        _tm = re.findall(r'^\s*Type:\s*(\S+)', tail, re.MULTILINE)
+        if _tm:
+            info['type'] = _tm[-1].strip()
+        elif info['type'] is None:
+            tm = re.search(r'\(([^)]+)\)', tail)
+            if tm:
+                info['type'] = tm.group(1).strip()
+        return info
+
+    @staticmethod
+    def _logfile_type(path: str) -> Optional[str]:
+        """Most specific sonde type for a log file: the latest per-frame
+        'Type: <subtype>' line if present (e.g. DFM17), else the header
+        'Sonde: <serial> (<type>)' base type (e.g. DFM). This is what makes a
+        DFM log show DFM17 rather than the generic 'DFM' from the header, and
+        fixes all-numeric DFM serials being mis-guessed as 'Unknown'."""
+        header_type = None
+        subtype = None
+        try:
+            with open(path, 'r', errors='ignore') as f:
+                head = f.read(400)
+                hm = re.search(r'Sonde:\s*\S+\s*\(([^)]+)\)', head)
+                if hm:
+                    header_type = hm.group(1).strip()
+                try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 4096))
+                except (OSError, ValueError):
+                    f.seek(0)
+                tail = f.read()
+        except OSError:
+            return None
+        tm = re.findall(r'^\s*Type:\s*(\S+)', tail, re.MULTILINE)
+        if tm:
+            subtype = tm[-1].strip()
+        # Prefer a subtype that refines (or is longer/more specific than) the base.
+        if subtype and (not header_type
+                        or subtype.upper().startswith(header_type.upper())
+                        or len(subtype) >= len(header_type)):
+            return subtype
+        return header_type or subtype
+
+    def _landing_from_log(self, path: str) -> Optional[dict]:
+        """Extract a sonde's LANDING (last known) position + metadata from a log:
+        the last frame that carries a Position, with its altitude, vertical
+        velocity, frequency, timestamp and resolved type. Reads only the file
+        tail (landings are near the end). Returns None if no position exists."""
+        try:
+            with open(path, 'r', errors='ignore') as f:
+                try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 131072))   # 128 KB tail ≈ many final frames
+                except (OSError, ValueError):
+                    f.seek(0)
+                tail = f.read()
+        except OSError:
+            return None
+
+        # Split into per-frame blocks and scan from the end for the last fix.
+        blocks = re.split(r'(?m)^Frame\s', tail)
+        last = None
+        for blk in reversed(blocks):
+            pm = re.search(r'Position:\s*([+-]?\d+\.\d+),\s*([+-]?\d+\.\d+)', blk)
+            if not pm:
+                continue
+            try:
+                lat = float(pm.group(1))
+                lon = float(pm.group(2))
+            except ValueError:
+                continue
+            tsm = re.match(r'\s*\d+\s*-\s*(\S+)', blk)
+            alt_m = re.search(r'Altitude:\s*([+-]?\d+(?:\.\d+)?)', blk)
+            vv_m = re.search(r'Velocity H/V:\s*[+-]?\d+(?:\.\d+)?/([+-]?\d+(?:\.\d+)?)', blk)
+            last = {
+                'lat': lat, 'lon': lon,
+                'timestamp': tsm.group(1) if tsm else None,
+                'alt': float(alt_m.group(1)) if alt_m else None,
+                'vvel': float(vv_m.group(1)) if vv_m else None,
+            }
+            break
+        if last is None:
+            return None
+        # Frequency: last Frequency line anywhere in the tail (nearly constant).
+        fr = re.findall(r'Frequency:\s*([+-]?\d+(?:\.\d+)?)', tail)
+        last['frequency'] = float(fr[-1]) if fr else None
+        last['type'] = self._logfile_type(path)
+        return last
+
     def _load_sonde_from_logs(self, sonde_serial: str) -> Optional[Dict]:
         """Load sonde data from log files when not in active memory.
-        
+
         Args:
             sonde_serial: Sonde serial number to search for
-            
+    
         Returns:
             Sonde dict with telemetry data, or None if not found
         """
@@ -3325,7 +4196,10 @@ class WebUI:
                         try:
                             with open(logfile, 'w') as f:
                                 f.write(f"OpenWXSDR Sonde Log\n")
-                                f.write(f"Sonde: {serial} ({telemetry.sonde_type})\n")
+                                # Prefer the specific subtype (e.g. DFM17, RS41-SGP)
+                                # when it's already resolved at first frame.
+                                _hdr_type = getattr(telemetry, 'subtype', None) or telemetry.sonde_type
+                                f.write(f"Sonde: {serial} ({_hdr_type})\n")
                                 receiver_name = telemetry.receiver_device if telemetry.receiver_device else 'Unknown'
                                 f.write(f"Receiver: {receiver_name}\n")
                                 f.write(f"Started: {datetime.now().isoformat()}\n")
@@ -3356,8 +4230,23 @@ class WebUI:
                     with open(self.sonde_logfiles[serial], 'a') as f:
                         # Format telemetry data
                         f.write(f"Frame {telemetry.frame_number} - {data.get('timestamp', 'N/A')}\n")
+                        # Record the resolved type/subtype per frame so the exact
+                        # DFM/RS subtype (e.g. DFM17) can be recovered from the log
+                        # later even though it isn't known when the header is written.
+                        _ftype = data.get('subtype') or data.get('type')
+                        if _ftype:
+                            f.write(f"  Type: {_ftype}\n")
                         if data.get('lat') is not None and data.get('lon') is not None:
                             f.write(f"  Position: {data['lat']:.5f}, {data['lon']:.5f}\n")
+                            # Elevation angle from this gateway to the sonde (needs
+                            # a fix; uses station lat/lon/alt). Written per frame so
+                            # it's available in the log and the statistics graph.
+                            _st = self.config.get('station', {})
+                            _look = self._look_angles(
+                                _st.get('lat'), _st.get('lon'), _st.get('alt', 0),
+                                data.get('lat'), data.get('lon'), data.get('alt'))
+                            if _look is not None:
+                                f.write(f"  Elevation: {_look['elevation_deg']:.1f}°\n")
                         if data.get('alt') is not None:
                             f.write(f"  Altitude: {data['alt']:.1f} m\n")
                         # CRITICAL: Write vel_v only if it exists, don't default to 0
@@ -3388,6 +4277,12 @@ class WebUI:
             
             # Increment total frame counter
             self.total_frames_received += 1
+            # Increment today's (UTC) frame counter, rolling over at UTC midnight.
+            _utc_day = datetime.utcnow().strftime('%Y-%m-%d')
+            if _utc_day != self._today_frames_date:
+                self._today_frames_date = _utc_day
+                self._today_frames = 0
+            self._today_frames += 1
             
             # Log first complete telemetry frame to structured action log
             if serial in self.sonde_first_frames and not self.sonde_first_frames[serial]:

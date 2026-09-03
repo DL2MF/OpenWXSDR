@@ -58,6 +58,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -349,6 +350,16 @@ class _ChannelizerChannel:
     phase_acc: float  # radians, maintained across chunks for phase-continuous DDC
     metrics:   SignalMetrics = field(default_factory=SignalMetrics)
     queue:     object = None  # threading.Queue for output chunks (set in __post_init__)
+    # Streaming (overlap-save) resampler state — see _reader_loop. Without this,
+    # resample_poly ran per chunk from a zero filter state, re-introducing a large
+    # anti-alias transient every chunk that corrupted the FSK (decoder never
+    # locked). res_prev = previous chunk's DDC baseband (emitted one chunk late so
+    # both the warm-up history AND a lookahead are real samples); res_hist = the
+    # warm-up samples immediately preceding res_prev.
+    res_prev_r: object = None
+    res_prev_i: object = None
+    res_hist_r: object = None
+    res_hist_i: object = None
 
     def __post_init__(self):
         import queue as _queue
@@ -377,7 +388,8 @@ class AirspyChannelizer:
     def __init__(self, center_freq: int, sample_rate: int = 6_000_000,
                  lna_gain: int = 14, mixer_gain: int = 14, vga_gain: int = 14,
                  serial: str = '', ppm_correction: int = 0,
-                 airspy_qi_order: bool = False):
+                 airspy_qi_order: bool = False, debug_iq_dump: bool = False):
+        self.debug_iq_dump  = bool(debug_iq_dump)
         self.center_freq    = center_freq
         self.sample_rate    = sample_rate
         self.lna_gain       = min(max(lna_gain,   0), AirspyPipeline.LNA_GAIN_MAX)
@@ -396,11 +408,22 @@ class AirspyChannelizer:
         self._res_up   = 48_000 // _g
         self._res_down = sample_rate // _g
 
+        # Overlap-save history length (input samples) for the streaming resampler.
+        # resample_poly's internal Kaiser filter is 2*10*max(up,down)+1 taps at the
+        # up-sampled rate; its one-sided reach in INPUT samples is that/(2*up). We
+        # round UP to a whole multiple of res_down so every resampled block has an
+        # exact integer output length (no sample-rate drift over time).
+        _filt_len   = 2 * 10 * max(self._res_up, self._res_down) + 1
+        _one_sided  = _filt_len // (2 * self._res_up) + 1
+        self._res_hist_len = ((_one_sided + self._res_down - 1)
+                              // self._res_down) * self._res_down
+
         self._channels:  Dict[float, _ChannelizerChannel] = {}
         self._ch_lock    = threading.Lock()
         self._proc:      Optional[subprocess.Popen] = None
         self._reader_th: Optional[threading.Thread] = None
         self._running    = False
+        self._drops      = 0   # count of dropped output blocks (queue full)
 
     def start(self) -> bool:
         """Launch airspy_rx at center_freq and start the reader/channelizer thread."""
@@ -529,9 +552,30 @@ class AirspyChannelizer:
 
     @staticmethod
     def _pipe_writer(frequency: float, ch: '_ChannelizerChannel'):
-        """Dedicated thread: drains ch.queue and writes to the pipe."""
+        """Dedicated thread: drains ch.queue and writes to the pipe.
+
+        Diagnostic: enable with sdr.airspy.debug_iq_dump: true (or env
+        OPENWXSDR_IQ_DUMP=1) to also tee the EXACT bytes fed to the decoder to
+        data/logs/ch_dump_<freq>.raw (in the app folder — no /tmp, so it's
+        visible even under systemd PrivateTmp). Test it offline with:
+          decoders/rs1729/rs41mod -vv --ptu2 --json --ecc2 --IQ 0.0 \
+              data/logs/ch_dump_<freq>.raw 48000 16
+        Decodes there => channelizer IQ is good (issue is real-time/pipe). No
+        decode => the DDC output itself is the problem.
+        """
         import queue as _queue
         logger = logging.getLogger(f'AirspyCh.{frequency/1e6:.3f}')
+        dump = None
+        if self.debug_iq_dump or os.environ.get('OPENWXSDR_IQ_DUMP'):
+            try:
+                os.makedirs('data/logs', exist_ok=True)
+                dump_path = os.path.abspath(
+                    f"data/logs/ch_dump_{frequency/1e6:.3f}.raw")
+                dump = open(dump_path, 'wb')
+                logger.info(f"IQ dump enabled -> {dump_path} (48 kHz int16 IQ)")
+            except OSError as exc:
+                logger.warning(f"IQ dump could not open file: {exc}")
+                dump = None
         while True:
             try:
                 item = ch.queue.get(timeout=2.0)
@@ -543,10 +587,20 @@ class AirspyChannelizer:
                 os.write(ch.write_fd, item)
             except OSError:
                 break  # decoder closed read-end
+            if dump is not None:
+                try:
+                    dump.write(item)
+                except OSError:
+                    pass
         try:
             os.close(ch.write_fd)
         except OSError:
             pass
+        if dump is not None:
+            try:
+                dump.close()
+            except OSError:
+                pass
         logger.debug(f"PipeWriter exited for {frequency/1e6:.4f} MHz")
 
     def _reader_loop(self):
@@ -593,14 +647,16 @@ class AirspyChannelizer:
                     f"({_chunk_count * self.CHUNK_SAMPLES / self.sample_rate:.0f} s)"
                 )
 
-            # Snapshot active channels (avoids holding lock during heavy computation)
+            # Snapshot active channels (avoids holding lock during heavy computation).
+            # ch is the live object; only this reader thread mutates its DDC/resampler
+            # state, so reading/updating it outside the membership lock is safe.
             with self._ch_lock:
                 snapshot = {
-                    f: (ch.offset, ch.phase_acc, ch.queue)
+                    f: (ch.offset, ch.phase_acc, ch.queue, ch)
                     for f, ch in self._channels.items()
                 }
 
-            for freq, (offset, phase_acc, ch_queue) in snapshot.items():
+            for freq, (offset, phase_acc, ch_queue, ch_obj) in snapshot.items():
                 try:
                     # Log phase accumulator at chunk start (first 2 chunks for > 1 MHz offset)
                     if _chunk_count <= _DIAG_CHUNKS and offset > 1000000:
@@ -631,27 +687,47 @@ class AirspyChannelizer:
                     mixed_r = iq_r * cos_p + iq_i * sin_p
                     mixed_i = iq_i * cos_p - iq_r * sin_p
 
-                    # Pre-decimation diagnostics
-                    if _chunk_count <= _DIAG_CHUNKS:
-                        mixed_rms = float(np.sqrt(np.mean(mixed_r**2 + mixed_i**2)))
-                        self.logger.debug(
-                            f"Pre-dec RMS [{freq/1e6:.4f} MHz, chunk {_chunk_count}]: {mixed_rms:.6f}"
-                        )
+                    # ---- Streaming (overlap-save) polyphase resampling ----------
+                    # resample_poly is stateless, so calling it per chunk restarts
+                    # its long anti-alias filter from zero every chunk → a transient
+                    # that corrupts the FSK (decoder never locks). Instead we emit
+                    # the PREVIOUS chunk resampled inside a buffer that has REAL
+                    # samples on both sides — res_hist (warm-up) before it and this
+                    # chunk's head as lookahead after it — so both filter edges are
+                    # settled. One-chunk (~2.5 ms) latency; sample-rate is drift-free
+                    # because history and chunk are whole multiples of res_down.
+                    H = self._res_hist_len
+                    if ch_obj.res_prev_r is None:
+                        # Prime: stash this chunk, emit nothing yet.
+                        with self._ch_lock:
+                            if freq in self._channels:
+                                self._channels[freq].phase_acc = new_acc
+                                self._channels[freq].res_prev_r = mixed_r
+                                self._channels[freq].res_prev_i = mixed_i
+                                self._channels[freq].res_hist_r = np.zeros(H, np.float32)
+                                self._channels[freq].res_hist_i = np.zeros(H, np.float32)
+                        continue
 
-                    # Polyphase resampling with explicit I/Q paths for predictable behavior.
-                    # This also improves adjacent-channel rejection vs. boxcar decimation.
-                    dec_r = scipy_signal.resample_poly(
-                        mixed_r.astype(np.float64),
-                        self._res_up,
-                        self._res_down,
-                        window=('kaiser', 8.0)
-                    ).astype(np.float32)
-                    dec_i = scipy_signal.resample_poly(
-                        mixed_i.astype(np.float64),
-                        self._res_up,
-                        self._res_down,
-                        window=('kaiser', 8.0)
-                    ).astype(np.float32)
+                    prev_r, prev_i = ch_obj.res_prev_r, ch_obj.res_prev_i
+                    hist_r, hist_i = ch_obj.res_hist_r, ch_obj.res_hist_i
+                    look = min(H, len(mixed_r))
+                    buf_r = np.concatenate((hist_r, prev_r, mixed_r[:look]))
+                    buf_i = np.concatenate((hist_i, prev_i, mixed_i[:look]))
+                    full_r = scipy_signal.resample_poly(
+                        buf_r.astype(np.float64), self._res_up, self._res_down,
+                        window=('kaiser', 8.0)).astype(np.float32)
+                    full_i = scipy_signal.resample_poly(
+                        buf_i.astype(np.float64), self._res_up, self._res_down,
+                        window=('kaiser', 8.0)).astype(np.float32)
+                    drop_pre = H * self._res_up // self._res_down
+                    out_len  = len(prev_r) * self._res_up // self._res_down
+                    dec_r = full_r[drop_pre:drop_pre + out_len]
+                    dec_i = full_i[drop_pre:drop_pre + out_len]
+                    # New warm-up = tail of the chunk we just emitted; carry current.
+                    new_hist_r = (prev_r[-H:] if len(prev_r) >= H
+                                  else np.concatenate((hist_r, prev_r))[-H:])
+                    new_hist_i = (prev_i[-H:] if len(prev_i) >= H
+                                  else np.concatenate((hist_i, prev_i))[-H:])
 
                     # Log DDC output amplitude for first few chunks to verify signal
                     if _chunk_count <= _DIAG_CHUNKS:
@@ -660,10 +736,14 @@ class AirspyChannelizer:
                             f"DDC RMS [{freq/1e6:.4f} MHz, chunk {_chunk_count}]: {rms:.6f}"
                         )
 
-                    # Update phase accumulator
+                    # Advance DDC + resampler state.
                     with self._ch_lock:
                         if freq in self._channels:
                             self._channels[freq].phase_acc = new_acc
+                            self._channels[freq].res_prev_r = mixed_r
+                            self._channels[freq].res_prev_i = mixed_i
+                            self._channels[freq].res_hist_r = new_hist_r
+                            self._channels[freq].res_hist_i = new_hist_i
                             self._channels[freq].metrics.update_iq(dec_r, dec_i)
                             if _chunk_count <= _DIAG_CHUNKS and offset > 1000000:
                                 self.logger.info(
@@ -679,11 +759,20 @@ class AirspyChannelizer:
                     out[1::2] = np.clip(dec_i * np.float32(32767.0),
                                         -32768, 32767).astype(np.int16)
 
-                    # Non-blocking enqueue; drop if queue is full (slow decoder)
+                    # Non-blocking enqueue; drop if queue is full (slow decoder).
+                    # Dropped output = a GAP in the decoder's IQ stream, which
+                    # breaks FSK sync — log it so a real-time overload is visible
+                    # instead of silently producing zero frames.
                     try:
                         ch_queue.put_nowait(out.tobytes())
                     except Exception:
-                        pass
+                        self._drops += 1
+                        if self._drops == 1 or self._drops % 200 == 0:
+                            self.logger.warning(
+                                f"Channelizer output queue full — dropped "
+                                f"{self._drops} block(s); decoder IQ has gaps "
+                                f"(real-time overload?)"
+                            )
 
                 except Exception as exc:
                     self.logger.debug(f"Channel {freq/1e6:.4f} MHz DDC error: {exc}")
@@ -728,7 +817,10 @@ class AirspyScanner:
                  freq_ranges: list = None,
                  frequency_blacklist: list = None,
                  debug_mode: bool = False,
-                 airspy_qi_order: bool = False):
+                 airspy_qi_order: bool = False,
+                 min_bw_hz: int = 2_400,
+                 birdie_snr_db: float = 12.0,
+                 birdie_min_bw_hz: int = 4_500):
         self.center_freq     = center_freq
         self.sample_rate     = sample_rate
         self.lna_gain        = min(max(lna_gain, 0), AirspyPipeline.LNA_GAIN_MAX)
@@ -739,6 +831,17 @@ class AirspyScanner:
         self.blacklist_hz    = frequency_blacklist or []
         self.debug_mode      = debug_mode
         self.airspy_qi_order = bool(airspy_qi_order)
+        # Bandwidth gating (see _detect_signals):
+        #   min_bw_hz        — absolute floor; anything narrower is never a sonde.
+        #   birdie_snr_db /  — a STRONG-but-NARROW peak is a CW/spur birdie, not a
+        #   birdie_min_bw_hz    sonde: a real RS41/DFM at high SNR spreads WIDE
+        #                       above the detection floor, a birdie stays a sharp
+        #                       spike. Reject when SNR>=birdie_snr_db AND
+        #                       BW<birdie_min_bw_hz. Targets exactly the observed
+        #                       401.x MHz ghosts (12-17 dB / 2.4-3.1 kHz).
+        self.min_bw_hz        = int(min_bw_hz)
+        self.birdie_snr_db    = float(birdie_snr_db)
+        self.birdie_min_bw_hz = int(birdie_min_bw_hz)
         self.logger          = logging.getLogger('AirspyScanner')
         # Last spectrum snapshot: set by _detect_signals, read by AirspyReceiver
         self.last_spectrum: dict = {}
@@ -929,14 +1032,15 @@ class AirspyScanner:
         }
 
         signals: List[DetectedSignal] = []
-        MIN_SEP  = 50_000   # Hz — minimum separation between distinct peaks
-        MIN_BW   = 2_400    # Hz — radiosonde minimum: RS41 ≈ 2.4 kHz, DFM ≈ 4 kHz
-        DC_GUARD = 100_000  # Hz — exclude LO/DC leakage near center
+        MIN_SEP  = 50_000        # Hz — minimum separation between distinct peaks
+        MIN_BW   = self.min_bw_hz  # Hz — radiosonde minimum: RS41 ≈ 2.4 kHz, DFM ≈ 4 kHz
+        DC_GUARD = 100_000       # Hz — exclude LO/DC leakage near center
 
         n_above_thr = 0
         n_dc_guard  = 0
         n_oor       = 0
         n_narrow    = 0
+        n_birdie    = 0
 
         for i in range(1, len(snr) - 1):
             if np.isnan(snr[i]) or snr[i] < self.threshold_db:
@@ -981,6 +1085,19 @@ class AirspyScanner:
                 )
                 continue
 
+            # Reject STRONG-but-NARROW peaks as CW/spur birdies. A real sonde at
+            # this SNR spreads WIDE above the detection floor; a birdie stays a
+            # sharp spike. This surgically drops the observed 401.x MHz ghosts
+            # (12-17 dB / 2.4-3.1 kHz) without touching weak/narrow real sondes.
+            if snr[i] >= self.birdie_snr_db and bw < self.birdie_min_bw_hz:
+                n_birdie += 1
+                _log_fn(
+                    f"Strong-narrow birdie reject: {freq/1e6:.4f} MHz "
+                    f"(SNR {snr[i]:.1f} dB ≥ {self.birdie_snr_db:.0f}, "
+                    f"BW {bw/1e3:.2f} kHz < {self.birdie_min_bw_hz/1e3:.1f} kHz)"
+                )
+                continue
+
             signals.append(DetectedSignal(
                 frequency=freq,
                 strength=float(snr[i]),
@@ -992,7 +1109,7 @@ class AirspyScanner:
             self.logger.info(
                 f"Detection: {n_above_thr} peaks >{self.threshold_db:.0f} dB "
                 f"(DC-guard={n_dc_guard}, out-of-range={n_oor}, "
-                f"narrow-BW={n_narrow}, accepted={len(signals)})"
+                f"narrow-BW={n_narrow}, birdie={n_birdie}, accepted={len(signals)})"
             )
 
         return sorted(signals, key=lambda s: s.strength, reverse=True)
@@ -1079,6 +1196,12 @@ class AirspyReceiver:
         self._scan_clip_trigger_pct = float(
             airspy_cfg.get('scan_clip_trigger_pct', 0.2)
         )
+        # Ghost/birdie rejection thresholds passed to AirspyScanner._detect_signals.
+        self._scan_min_bw_hz = int(airspy_cfg.get('scan_min_bw_hz', 2_400))
+        self._birdie_snr_db  = float(airspy_cfg.get('birdie_reject_snr_db', 12.0))
+        self._birdie_min_bw_hz = int(airspy_cfg.get('birdie_reject_bw_hz', 4_500))
+        # Diagnostic: tee channelizer decoder-input IQ to data/logs/ch_dump_*.raw
+        self._debug_iq_dump  = bool(airspy_cfg.get('debug_iq_dump', False))
         self._ppm           = int(airspy_cfg.get('ppm_correction', 0))
         self._scan_interval = det_cfg.get('airspy_scan_interval',
                               rx_cfg.get('scan_interval', 15))
@@ -1088,6 +1211,39 @@ class AirspyReceiver:
         # Runtime-mutable: can be changed from the web UI without restart
         self._debug_mode    = bool(log_cfg.get('debug_mode', False))
         self._snr_threshold = float(det_cfg.get('scan_threshold', 10.0))
+
+        # dft_detect correlation classification for the Airspy path. Previously
+        # the Airspy path classified auto-detected signals purely by bandwidth
+        # (_bandwidth_fallback), while the RTL path used dft_detect correlation —
+        # so the two front-ends could type the same sonde differently. Here we
+        # give Airspy the SAME correlation classifier: for each auto-detected
+        # candidate we capture a short 48 kHz int16 IQ clip (airspy_rx→sox, the
+        # exact format dft_detect --iq consumes) and correlate it. Falls back to
+        # the bandwidth guess if dft_detect is unavailable or returns no match.
+        # Default follows detection.use_dft_detect; override per station with
+        # detection.airspy_use_dft_detect. Fixed/manual channels keep their
+        # explicit type and never enter this path.
+        self._use_dft = bool(det_cfg.get('airspy_use_dft_detect',
+                                         det_cfg.get('use_dft_detect', True)))
+        self._dft = None
+        if self._use_dft:
+            try:
+                from .dft_detector import DftDetector
+                self._dft = DftDetector(
+                    dft_detect_path=det_cfg.get('dft_detect_path', 'dft_detect'),
+                    thresholds=det_cfg.get('dft_thresholds') or None,
+                )
+                if not self._dft.available:
+                    self.logger.warning(
+                        "Airspy: dft_detect not available — classifying by "
+                        "bandwidth. Run scripts/install_softchain.sh to build it."
+                    )
+                    self._dft = None
+            except Exception as exc:  # noqa: BLE001 - classification is optional
+                self.logger.warning(
+                    f"Airspy: DftDetector init failed ({exc}) — classifying by bandwidth"
+                )
+                self._dft = None
 
         # Latest spectrum snapshot: dict with keys freqs_mhz, power_db, noise_floor,
         # threshold_db, signals, timestamp — served by /api/spectrum
@@ -1504,6 +1660,9 @@ class AirspyReceiver:
             frequency_blacklist=self._blacklist,
             debug_mode=self._debug_mode,
             airspy_qi_order=self._airspy_qi_order,
+            min_bw_hz=self._scan_min_bw_hz,
+            birdie_snr_db=self._birdie_snr_db,
+            birdie_min_bw_hz=self._birdie_min_bw_hz,
         )
         self.logger.info(
             f"Scanning {self._center_freq/1e6:.1f} MHz "
@@ -1553,6 +1712,9 @@ class AirspyReceiver:
                 frequency_blacklist=self._blacklist,
                 debug_mode=self._debug_mode,
                 airspy_qi_order=self._airspy_qi_order,
+                min_bw_hz=self._scan_min_bw_hz,
+                birdie_snr_db=self._birdie_snr_db,
+                birdie_min_bw_hz=self._birdie_min_bw_hz,
             )
             low_signals = scanner_low.scan()
             signals = self._merge_detected_signals(signals, low_signals)
@@ -1583,7 +1745,21 @@ class AirspyReceiver:
                     f"skipping {sig.frequency/1e6:.4f} MHz"
                 )
                 break
-            self._add_channel(sig)
+            # Classify by dft_detect correlation (same engine as the RTL path)
+            # before committing a decoder; None → _add_channel uses the
+            # bandwidth fallback.
+            #
+            # ONLY in legacy mode. In channelizer mode a single airspy_rx is held
+            # open continuously by the channelizer, so opening a SECOND airspy_rx
+            # here for the classification clip is architecturally wrong: the
+            # back-to-back scan→clip→channelizer device opens leave the Airspy in
+            # a degraded state (observed: DDC RMS collapses to ~0.002, decoder
+            # healthy but zero frames). Channelizer mode keeps the pre-1.0.62
+            # bandwidth classification.
+            override = None
+            if self._decode_mode != 'channelizer':
+                override = self._classify_with_dft(sig)
+            self._add_channel(sig, override_type=override)
 
         if self._decoders:
             return  # state already set to DECODING by _add_channel
@@ -1749,6 +1925,124 @@ class AirspyReceiver:
         self._legacy_probe_state['next_index'] = next_index + 1
         return float(candidates[next_index])
 
+    def _classify_with_dft(self, sig: DetectedSignal) -> Optional[str]:
+        """Classify an auto-detected candidate via dft_detect correlation.
+
+        Captures a short IQ clip from the Airspy at sig.frequency and runs the
+        shared DftDetector. Returns the sonde type on a confident match, else
+        None (caller falls back to the bandwidth guess). The dft frequency
+        offset is logged but not applied — the legacy probe already refines the
+        tune, and the reliability win here is the correct TYPE.
+        """
+        if self._dft is None:
+            return None
+        iq_file = self._capture_iq_clip(sig.frequency, self._dft.sample_duration)
+        if not iq_file:
+            return None
+        try:
+            result = self._dft.classify_iq_file(iq_file, 48_000)
+        finally:
+            try:
+                os.unlink(iq_file)
+            except OSError:
+                pass
+        if result:
+            sonde_type, offset = result
+            self.logger.info(
+                f"Airspy DFT identified {sonde_type} at {sig.frequency/1e6:.4f} MHz "
+                f"(offset {offset:+.0f} Hz)"
+            )
+            return sonde_type
+        self.logger.info(
+            f"Airspy DFT: no confident match at {sig.frequency/1e6:.4f} MHz "
+            f"— using bandwidth classification"
+        )
+        return None
+
+    def _capture_iq_clip(self, frequency: float, seconds: float) -> Optional[str]:
+        """Capture ~`seconds` of 48 kHz signed-16 int IQ at `frequency` to a temp
+        .raw file (airspy_rx→sox), the exact format dft_detect --iq expects.
+
+        Runs only while the receiver is between scans (device is free), mirroring
+        the RTL path's close-scan → capture → reopen-decoder sequence. Returns the
+        file path, or None on failure. Caller deletes the file.
+        """
+        adj_freq = frequency * (1.0 + self._ppm / 1e6)
+        lna   = min(self._gain, AirspyPipeline.LNA_GAIN_MAX)
+        mixer = min(self._gain, AirspyPipeline.MIXER_GAIN_MAX)
+        vga   = min(self._gain, AirspyPipeline.VGA_GAIN_MAX)
+
+        airspy_cmd = [
+            'airspy_rx',
+            '-f', f'{adj_freq/1e6:.6f}',
+            '-a', str(self._sample_rate),
+            '-r', '-',
+            '-l', str(lna), '-m', str(mixer), '-v', str(vga),
+        ]
+        if self._serial:
+            airspy_cmd += ['-p', str(self._serial)]
+        sox_cmd = [
+            'sox',
+            '-t', 'raw', '-e', 'signed-integer', '-b', '16',
+            '-r', str(self._sample_rate), '-c', '2', '-',
+            '-t', 'raw', '-e', 'signed-integer', '-b', '16',
+            '-r', '48000', '-c', '2', '-',
+        ]
+
+        fd, path = tempfile.mkstemp(suffix='.raw', prefix='openwxsdr_airspy_dft_')
+        os.close(fd)
+        airspy_proc = sox_proc = None
+        try:
+            with open(path, 'wb') as out:
+                airspy_proc = subprocess.Popen(
+                    airspy_cmd, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, bufsize=0)
+                sox_proc = subprocess.Popen(
+                    sox_cmd, stdin=airspy_proc.stdout, stdout=out,
+                    stderr=subprocess.DEVNULL, bufsize=0)
+                airspy_proc.stdout.close()
+                time.sleep(max(1.0, float(seconds)))
+                for p in (sox_proc, airspy_proc):
+                    if p and p.poll() is None:
+                        try:
+                            p.terminate()
+                            p.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            p.kill()
+                            p.wait()
+            # Let libusb fully release the Airspy before the decode pipeline
+            # reopens it — a back-to-back airspy_rx open otherwise risks a
+            # degraded (low-gain) capture on the same device.
+            time.sleep(0.8)
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            if size < 4096:
+                self.logger.warning(
+                    f"Airspy DFT clip too small ({size} bytes) at "
+                    f"{frequency/1e6:.4f} MHz — skipping correlation"
+                )
+                os.unlink(path)
+                return None
+            return path
+        except FileNotFoundError as exc:
+            self.logger.error(
+                f"Airspy DFT clip capture: tool not found ({exc}). "
+                "Install with: sudo apt-get install -y airspy sox"
+            )
+        except Exception as exc:  # noqa: BLE001 - classification is optional
+            self.logger.warning(f"Airspy DFT clip capture failed: {exc}")
+            for p in (sox_proc, airspy_proc):
+                if p and p.poll() is None:
+                    try:
+                        p.kill()
+                        p.wait()
+                    except Exception:
+                        pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+
     def _add_channel(self, sig: DetectedSignal,
                      override_type: Optional[str] = None,
                      probe_state: Optional[dict] = None,
@@ -1855,6 +2149,7 @@ class AirspyReceiver:
                 serial=self._serial,
                 ppm_correction=self._ppm,
                 airspy_qi_order=self._airspy_qi_order,
+                debug_iq_dump=self._debug_iq_dump,
             )
             if not self._channelizer.start():
                 self.logger.error("AirspyChannelizer failed to start")

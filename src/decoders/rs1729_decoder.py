@@ -772,8 +772,21 @@ class RS1729Decoder:
                 cmd.extend(['-v', '--dc', '--ptu', '--json', '--IQ', '0.0', '--lpIQ',
                             '-', str(self.sample_rate), '16'])
             elif self.sonde_type == 'RS92':
-                # RS92: rs92mod -v --IQ 0.0 - 48000 16
-                cmd.extend(['-v', '--IQ', '0.0', '-', str(self.sample_rate), '16'])
+                # RS92: rs92mod -v [-e <ephemeris>] --IQ 0.0 - 48000 16
+                # RS92 needs the current GPS-day broadcast ephemeris (RINEX) to
+                # solve a position. If the opt-in downloader has today's file
+                # (config rs92.ephemeris_download, see src/sdr/ephemeris.py) pass
+                # it with -e; otherwise decode as before (position may be absent).
+                try:
+                    from ..sdr.ephemeris import rs92_today_file
+                    _ephem = rs92_today_file()
+                except Exception:
+                    _ephem = None
+                cmd.append('-v')
+                if _ephem:
+                    cmd.extend(['-e', _ephem])
+                    self.logger.info(f"RS92: using GPS ephemeris {_ephem}")
+                cmd.extend(['--IQ', '0.0', '-', str(self.sample_rate), '16'])
             elif self.sonde_type == 'iMet':
                 # iMet: imet54mod -v --IQ 0.0 - 48000 16
                 cmd.extend(['-v', '--IQ', '0.0', '-', str(self.sample_rate), '16'])

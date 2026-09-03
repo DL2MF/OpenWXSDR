@@ -78,15 +78,30 @@ class DftDetector:
     - M10: ~0.75
     """
     
-    # Correlation thresholds from radiosonde_auto_rx
-    THRESHOLDS = {
+    # Correlation thresholds from radiosonde_auto_rx's 2019 calibration study
+    # (auto_rx/test/notes/2019-03-01_dft_detect_optimization.md). Those values
+    # were derived by correlating each header against real noise captures and
+    # against calibrated-SNR sonde samples, then setting the threshold just
+    # above the highest "unwanted type" score. They are a good STARTING point,
+    # not a universal truth: the noise-floor correlation depends on the
+    # receiver front end, so a station with a different dongle/LNA/RF
+    # environment can need different values. Override per station via
+    # config.yaml `detection.dft_thresholds` (see DEFAULT_THRESHOLDS use in
+    # __init__) rather than editing this table.
+    DEFAULT_THRESHOLDS = {
         'RS41': 0.53,
         'RS92': 0.54,
         'DFM': 0.62,
         'M10': 0.75,
         'M20': 0.75,
-        'iMet': 0.65  # Estimated threshold for iMet
+        'iMet': 0.65,  # Estimated — not covered by the auto_rx study, calibrate locally
+        'LMS6': 0.60,  # Estimated — auto_rx had no LMS6 IQ samples at study time
+        'MRZ': 0.60,   # Estimated — calibrate locally
     }
+
+    # Backwards-compatible alias: older code/tests referenced DftDetector.THRESHOLDS
+    # as a class attribute. Instance-level self.thresholds is authoritative.
+    THRESHOLDS = DEFAULT_THRESHOLDS
 
     # radiosonde_auto_rx uses a narrower IF/capture bandwidth for narrowband
     # sonde types during the detect step specifically to raise correlation
@@ -101,17 +116,40 @@ class DftDetector:
     WIDEBAND_SAMPLE_RATE_HZ = 48_000
     WIDEBAND_BANDWIDTH_THRESHOLD_HZ = 16_000
     
-    def __init__(self, dft_detect_path: str = 'dft_detect', sample_duration: float = 5.0):
+    def __init__(self, dft_detect_path: str = 'dft_detect', sample_duration: float = 5.0,
+                 thresholds: Optional[Dict[str, float]] = None):
         """
         Initialize DFT detector
-        
+
         Args:
             dft_detect_path: Path to dft_detect binary (default: 'dft_detect' in PATH)
             sample_duration: Duration of IQ capture in seconds (default: 5.0s)
+            thresholds: Optional per-type correlation threshold overrides, merged
+                over DEFAULT_THRESHOLDS. Supplied from config.yaml
+                `detection.dft_thresholds` so a station can be calibrated
+                without a code change. Unknown keys are kept (a locally built
+                dft_detect may emit types this file doesn't list); non-numeric
+                values are ignored with a warning.
         """
         self.dft_detect_path = dft_detect_path
         self.sample_duration = sample_duration
         self.logger = logging.getLogger('DftDetector')
+
+        self.thresholds = dict(self.DEFAULT_THRESHOLDS)
+        if thresholds:
+            for _type, _value in thresholds.items():
+                try:
+                    self.thresholds[str(_type)] = float(_value)
+                except (TypeError, ValueError):
+                    self.logger.warning(
+                        f"Ignoring non-numeric dft threshold for '{_type}': {_value!r}"
+                    )
+            _overrides = {
+                k: v for k, v in self.thresholds.items()
+                if self.DEFAULT_THRESHOLDS.get(k) != v
+            }
+            if _overrides:
+                self.logger.info(f"Using per-station dft_detect thresholds: {_overrides}")
         self.debug_mode = False  # Can be enabled for detailed correlation parsing logs
 
         # CRITICAL: install.sh clones rs1729/RS unpinned (plain `git clone` / `git pull`,
@@ -210,12 +248,15 @@ class DftDetector:
                 if best_match:
                     self.logger.info(
                         f"Detected {best_match.sonde_type} with correlation {best_match.correlation:.3f} "
-                        f"(threshold: {self.THRESHOLDS.get(best_match.sonde_type, 0.5):.3f}), "
+                        f"(threshold: {self.thresholds.get(best_match.sonde_type, 0.6):.3f}), "
                         f"frequency offset: {best_match.frequency:.1f} Hz"
                     )
                     # Return tuple: (sonde_type, frequency_offset) for frequency correction
                     return (best_match.sonde_type, best_match.frequency)
-                    self.logger.info("No sonde type exceeded correlation threshold")
+                # NOTE: the "nothing passed threshold" case is logged inside
+                # _select_best_match(), which has the per-type scores to report.
+                # (A log call used to sit here AFTER the return above, so it was
+                # unreachable and this case logged nothing at all.)
             else:
                 self.logger.warning("dft_detect returned no results")
             
@@ -228,6 +269,40 @@ class DftDetector:
             except:
                 pass
     
+    def classify_iq_file(
+        self, iq_file: str, sample_rate: int
+    ) -> Optional[Tuple[str, float]]:
+        """Classify an ALREADY-captured baseband IQ clip (signed-16 int, 2-ch)
+        via dft_detect correlation, decoupled from the RTL/rtl_fm capture in
+        detect_sonde_type().
+
+        This lets a non-RTL front-end (e.g. the Airspy path, which produces its
+        own 48 kHz int16 IQ via airspy_rx→sox) reuse the exact same correlation
+        engine, per-type calibrated thresholds and CLI-convention self-adaption
+        as the RTL path — so both front-ends classify identically instead of the
+        Airspy path relying on a bandwidth guess.
+
+        Returns (sonde_type, frequency_offset_hz) or None.
+        """
+        if not self.available:
+            return None
+        try:
+            results = self._run_dft_detect(iq_file, sample_rate)
+        except Exception as exc:  # noqa: BLE001 - never let classification crash a scan
+            self.logger.warning(f"classify_iq_file: dft_detect error: {exc}")
+            return None
+        if not results:
+            return None
+        best = self._select_best_match(results)
+        if best:
+            self.logger.info(
+                f"IQ-file correlation: {best.sonde_type} corr={best.correlation:.3f} "
+                f"(threshold {self.thresholds.get(best.sonde_type, 0.6):.3f}), "
+                f"offset {best.frequency:+.1f} Hz"
+            )
+            return (best.sonde_type, best.frequency)
+        return None
+
     def _capture_fm_audio(
         self,
         frequency: float,
@@ -520,8 +595,14 @@ class DftDetector:
         # (e.g. "DFM9"/"IMET4" instead of "DFM"/"iMet") — accept both and
         # normalize below so real correlation output isn't silently dropped
         # just because it doesn't match our expected spelling.
+        # MRZ was missing here even though config.yaml `detection.sonde_types`
+        # lists it and dft_detect emits it — every MRZ correlation line was
+        # silently discarded, so an MRZ could never be identified by DFT and
+        # always fell through to the bandwidth guess. IMET1/IMET5 and the
+        # RS41/RS92 sub-labels some builds emit (e.g. "RS41SG") are accepted
+        # too; \w* absorbs any build-specific suffix before the colon.
         line_pattern = re.compile(
-            r'^\s*(RS41|RS92|DFM9?|M10|M20|IMET4|iMet|LMS6)\s*:\s*'
+            r'^\s*(RS41|RS92|DFM9?|M10|M20|IMET4|IMET5|IMET1|iMet|LMS6|MRZ)\w*\s*:\s*'
             r'([+-]?\d+(?:\.\d+)?)'
             r'(?:\s*[,;]\s*([+-]?\d+(?:\.\d+)?)(?:\s*Hz)?)?\s*$',
             re.IGNORECASE,
@@ -538,10 +619,21 @@ class DftDetector:
                 continue
 
             sonde_type = match.group(1)
-            if sonde_type.lower() in ('imet', 'imet4'):
+            _t = sonde_type.lower()
+            if _t in ('imet', 'imet4', 'imet1', 'imet5'):
+                # Collapse the iMet variants onto the single type the rest of
+                # the pipeline (decoder path lookup, config sonde_types) knows.
                 sonde_type = 'iMet'
-            elif sonde_type.lower() in ('dfm', 'dfm9'):
+            elif _t in ('dfm', 'dfm9'):
                 sonde_type = 'DFM'
+            elif _t == 'mrz':
+                sonde_type = 'MRZ'
+            elif _t == 'lms6':
+                sonde_type = 'LMS6'
+            elif _t == 'rs41':
+                sonde_type = 'RS41'
+            elif _t == 'rs92':
+                sonde_type = 'RS92'
             correlation = float(match.group(2))
             freq_offset = float(match.group(3)) if match.group(3) is not None else 0.0
 
@@ -564,7 +656,7 @@ class DftDetector:
         best_match: Optional[CorrelationResult] = None
 
         for sonde_type, (correlation, freq_offset) in results.items():
-            threshold = self.THRESHOLDS.get(sonde_type, 0.6)
+            threshold = self.thresholds.get(sonde_type, 0.6)
             # CRITICAL: Use math.fabs() to handle negative correlations (M10/M20 phase inversion)
             if math.fabs(correlation) < threshold:
                 if self.debug_mode:
@@ -585,14 +677,36 @@ class DftDetector:
                     f"Acceptable candidate {sonde_type}: corr={correlation:.3f}, threshold={threshold:.3f}, offset={freq_offset:.1f} Hz"
                 )
 
-            if best_match is None or candidate.correlation > best_match.correlation:
+            # FIX: compare candidates by correlation MAGNITUDE, not signed value.
+            # The threshold test above already uses math.fabs() because M10/M20
+            # legitimately correlate NEGATIVELY (phase inversion) — a genuine M10
+            # scores about -0.95. The old comparison (`candidate.correlation >
+            # best_match.correlation`) was signed, so that -0.95 M10 lost to any
+            # marginal positive score that also cleared its own threshold (e.g. a
+            # 0.55 RS41), and the sonde was started with the wrong decoder. Using
+            # fabs() on both sides makes "best" mean "strongest match", which is
+            # what the threshold test already assumed.
+            if best_match is None or math.fabs(candidate.correlation) > math.fabs(best_match.correlation):
                 best_match = candidate
 
         if best_match:
             self.logger.info(
                 f"select_best_match best={best_match.sonde_type} corr={best_match.correlation:.3f} offset={best_match.frequency:.1f} Hz"
             )
-        elif self.debug_mode and results:
-            self.logger.debug(f"No candidate passed thresholds. Raw results: {results}")
+        elif results:
+            # Promoted from debug_mode-only: when dft_detect DID produce scores
+            # but none cleared its threshold, the caller silently drops to the
+            # bandwidth fallback. Without this line the logs give no indication
+            # of how close the correlation got, which is exactly the information
+            # needed to tell "threshold slightly too high for this station" apart
+            # from "no sonde there". Shows each type's score vs. its threshold.
+            _detail = ", ".join(
+                f"{t}={c:+.3f}/thr {self.thresholds.get(t, 0.6):.2f}"
+                for t, (c, _o) in sorted(results.items())
+            )
+            self.logger.info(
+                f"No sonde type exceeded its correlation threshold ({_detail}) "
+                f"— falling back to bandwidth-based type ID"
+            )
 
         return best_match

@@ -188,7 +188,27 @@ class OpenWXSDR:
             # Initialize channelizer status output early (needed by device_manager)
             self.logger.info("Initializing channelizer status output...")
             self.channelizer_status_output = ChannelizerStatusOutput(self.config)
-            
+
+            # RS92 GPS broadcast-ephemeris downloader (opt-in via
+            # rs92.ephemeris_download). Fetches the current GPS-day RINEX file
+            # into data/rs92 in the background so rs92mod can use it (-e).
+            from .sdr.ephemeris import configure as _configure_rs92_ephemeris
+            self.rs92_ephemeris = _configure_rs92_ephemeris(self.config)
+            if self.rs92_ephemeris.enabled:
+                self.logger.info(
+                    "RS92 ephemeris download ENABLED — fetching current GPS-day "
+                    f"file into {self.rs92_ephemeris.out_dir} (url: "
+                    f"{self.rs92_ephemeris.url_template}) ...")
+                self.rs92_ephemeris.start_background_refresh()
+            else:
+                # Logged so a mis-nested config is obvious. Must be nested YAML:
+                #   rs92:
+                #     ephemeris_download: true
+                # NOT a dotted key 'rs92.ephemeris_download: true'.
+                self.logger.info(
+                    "RS92 ephemeris download disabled "
+                    f"(config has rs92 section: {'rs92' in self.config})")
+
             # Initialize SDR
             sdr_type = self.config['sdr']['type']
             

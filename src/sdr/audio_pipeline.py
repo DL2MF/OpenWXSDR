@@ -48,6 +48,10 @@ import logging
 import threading
 import time
 import os
+try:
+    import fcntl  # Linux only; used to enlarge pipe buffers (F_SETPIPE_SZ)
+except ImportError:  # pragma: no cover - non-Linux
+    fcntl = None
 from typing import Optional
 
 import numpy as np
@@ -77,13 +81,16 @@ class AudioPipeline:
             gain: Tuner gain (0 = auto, or specific value 0-50)
             ppm_correction: PPM frequency correction (default 0)
             enable_metrics: If True, insert a Python pump thread between rtl_fm
-                and the decoder to compute live RSSI/SNR from the IQ stream.
-                If False (default), the decoder reads rtl_fm's stdout DIRECTLY
-                (V1.0.50 topology) — no Python thread in the signal path. The
-                pump is a prime suspect for the V1.0.52→60 RS41 frame-yield
+                and the decoder to compute live per-frame RSSI/SNR from the IQ
+                stream. If False (default), the decoder reads rtl_fm's stdout
+                DIRECTLY (V1.0.50 topology) — no Python thread in the signal path.
+                The pump was the prime suspect for the V1.0.52→60 RS41 frame-yield
                 regression: under CPU load it stalls, rtl_fm's stdout buffer
                 fills, librtlsdr silently drops samples, and the decoder loses
-                bit sync with no error anywhere.
+                bit sync. v1.0.62 mitigates BOTH failure modes: the metric
+                recompute is throttled (~10 Hz, see SignalMetrics.min_interval_s)
+                and both pipe buffers are enlarged (F_SETPIPE_SZ) so a brief
+                stall is absorbed by the kernel instead of dropping samples.
         """
         self.frequency = frequency
         self.sample_rate = sample_rate
@@ -176,6 +183,14 @@ class AudioPipeline:
                 self._pipe_read_fd, self._pipe_write_fd = os.pipe()
                 self._decoder_stream = open(self._pipe_read_fd, 'rb', closefd=True)
                 self._pipe_read_fd = None
+
+                # Enlarge BOTH pipe buffers so a brief Python-thread stall is
+                # absorbed by the kernel instead of backing up rtl_fm (whose full
+                # stdout buffer makes librtlsdr silently drop samples — the old
+                # frame-yield regression). At 48 kHz IQ (~192 KB/s) a few MB is
+                # many seconds of slack, so the pump can lag without dropping.
+                self._enlarge_pipe(self.rtl_process.stdout.fileno())
+                self._enlarge_pipe(self._pipe_write_fd)
 
                 self._pump_thread = threading.Thread(
                     target=self._pump_rtl_iq_to_decoder,
@@ -328,6 +343,23 @@ class AudioPipeline:
                     self.logger.debug(f"Error reading {process_name} stderr: {e}")
         except Exception as e:
             self.logger.error(f"Error in {process_name} stderr monitor: {e}")
+
+    def _enlarge_pipe(self, fd: int, size: int = 4 * 1024 * 1024) -> None:
+        """Best-effort enlarge a pipe's kernel buffer (Linux F_SETPIPE_SZ) so the
+        metrics pump can stall briefly without rtl_fm backing up. The kernel
+        clamps to /proc/sys/fs/pipe-max-size; any failure is harmless (we just
+        keep the default buffer)."""
+        if fcntl is None or not hasattr(fcntl, 'F_SETPIPE_SZ'):
+            return
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, int(size))
+        except (OSError, ValueError):
+            # Retry once at a smaller size in case the requested size exceeded
+            # the system max.
+            try:
+                fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, 1024 * 1024)
+            except (OSError, ValueError):
+                pass
 
     def _pump_rtl_iq_to_decoder(self):
         """Forward rtl_fm IQ bytes to decoder pipe while computing rolling metrics."""

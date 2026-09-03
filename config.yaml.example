@@ -138,6 +138,11 @@ sdr:
     channel_bandwidth: 12000  # Channel bandwidth in Hz (12 kHz typical for radiosondes)
     detection_threshold: 4  # Signal detection threshold in dB
     scan_clip_trigger_pct: 0.2  # Trigger fallback scan if >= this % of IQ samples are near full-scale.
+    # Ghost/birdie rejection during scan detection:
+    scan_min_bw_hz: 2400        # Absolute minimum signal bandwidth (Hz); narrower peaks are never sondes.
+    birdie_reject_snr_db: 12    # A STRONG-but-NARROW peak is a CW/spur birdie: reject if SNR >= this ...
+    birdie_reject_bw_hz: 4500   # ... AND bandwidth < this. Real sondes at high SNR spread wider than a spike.
+    debug_iq_dump: false        # Diagnostic (channelizer): tee the exact decoder-input IQ to data/logs/ch_dump_<freq>.raw for offline rs41mod testing.
     airspy_qi_order: false  # false = IQ interleaved, true = QI interleaved; only needed for channelizer/scanner experiments
     legacy_snap_hz: 10000   # In legacy mode, snap auto-detected frequencies to this grid before tuning (10 kHz matches common RS41 channels)
     legacy_probe_offsets_hz: [0, 1000, -1000, 2000, -2000, 5000, -5000]  # Legacy startup retune probe around the snapped frequency; widen this for drift-prone sondes like DFM
@@ -174,10 +179,12 @@ detection:
   scan_threshold: 10        # dB above noise floor for Airspy FFT scanning (averaged, so lower is fine)
 
   # RS41 fast-path: a scan peak whose 3 dB width is in this range is treated as
-  # RS41 immediately, skipping the ~15s dft_detect step (which added latency and
-  # sometimes missed weak RS41). dft_detect still runs for wider/ambiguous
-  # signals (DFM subtype, M10 vs M20, iMet). RS92 (2-3 kHz) stays below the range.
-  rs41_fastpath: true
+  # RS41 immediately, skipping the ~15s dft_detect step. DEFAULT OFF (false):
+  # skipping the correlation check is what let a narrow-measuring DFM start as
+  # RS41. With it off, every candidate is classified purely by dft_detect
+  # (auto_rx's method) — more reliable, ~15s slower per RS41. Set true per
+  # gateway where fast RS41 starts matter and DFM confusion isn't a problem.
+  rs41_fastpath: false
   rs41_fastpath_bw_min_hz: 3500
   rs41_fastpath_bw_max_hz: 7000
 
@@ -281,9 +288,20 @@ detection:
   # dft_detect built automatically from rs1729/RS during install.sh
   # Source: https://github.com/rs1729/RS/tree/master/scan
   use_dft_detect: true      # Enable DFT correlation detection (auto-fallback to bandwidth if unavailable)
+  airspy_use_dft_detect: true  # Also classify Airspy candidates via dft_detect (captures a short IQ clip per candidate). Defaults to use_dft_detect; set false to keep the old Airspy bandwidth-only classification.
   dft_detect_path: 'dft_detect'  # Path to dft_detect binary (or just 'dft_detect' if in PATH)
   # Capture duration is set via detection.detect_confirm_time above (falls back
   # to the older dft_sample_duration key here if detect_confirm_time is absent).
+  # Per-station correlation thresholds (override the auto_rx-calibrated defaults):
+  # dft_thresholds:
+  #   RS41: 0.53
+  #   RS92: 0.54
+  #   DFM:  0.62
+  #   M10:  0.75
+  #   M20:  0.75
+  #   iMet: 0.65   # estimated, not from the auto_rx study
+  #   LMS6: 0.60   # estimated, not from the auto_rx study
+  #   MRZ:  0.60   # estimated, not from the auto_rx study
 
   # Supported sonde types (auto-detect)
   sonde_types:
@@ -310,10 +328,34 @@ decoders:
   # pipeline stage never changes decode behaviour until verified.
   iq_dc_block: false
 
+  # Per-frame live RSSI/SNR (RTL-SDR): route rtl_fm's IQ through a Python pump
+  # that computes rolling RSSI/SNR from the signal, so the Active-sonde tile and
+  # map popup show FRESH values every frame instead of the one-time scan value.
+  # Historically off because a stalling pump could make librtlsdr drop samples
+  # (frame-yield regression); as of v1.0.62 the pump is throttled (~10 Hz metric
+  # recompute) and its pipe buffers are enlarged, so it's cheap and stall-safe.
+  # Enable and watch frame yield; leave it on if yield is unaffected. (Airspy
+  # already provides per-frame RSSI/SNR without this.)
+  live_signal_metrics: false
+
   # Decoder timeouts
   startup_timeout: 10       # seconds
   max_idle_time: 300        # seconds without frames before an auto-detected decoder stops and returns to scanning
   manual_idle_time: 1800    # seconds without frames before a manual/imported "decode until lost" decoder gives up (30 min default)
+
+# Vaisala RS92 GPS broadcast-ephemeris download.
+# RS92 sondes send raw GPS pseudoranges, so rs92mod needs the current GPS-day
+# broadcast ephemeris (RINEX nav file) to solve a position. Enable to auto-
+# download it into ephemeris_dir and feed rs92mod (-e). No effect on other types.
+rs92:
+  ephemeris_download: false   # true = download the current-day RINEX ephemeris for RS92
+  # Download URL template. Placeholders: {yyyy} 4-digit year, {yy} 2-digit year,
+  # {doy} zero-padded day-of-year (001-366). Default = BKG (Germany, HTTPS, no
+  # login) daily broadcast ephemeris. BKG serves RINEX3 mixed-nav only
+  # (BRDC00WRD_R_..._01D_MN.rnx.gz); current rs92mod reads RINEX3 and _MN has the
+  # GPS records. Only .gz or uncompressed URLs are supported (not CDDIS .Z).
+  ephemeris_url: 'https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{yyyy}/{doy}/BRDC00WRD_R_{yyyy}{doy}0000_01D_MN.rnx.gz'
+  ephemeris_dir: 'data/rs92'  # where downloaded ephemeris files are stored
 
 # Device recovery
 recovery:

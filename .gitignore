@@ -42,6 +42,7 @@ obj/x86/
 [Aa][Rr][Mm]64/
 [Aa][Rr][Mm]64[Ee][Cc]/
 bld/
+[Dd]ata/
 [Oo]bj/
 [Oo]ut/
 [Ll]og/
@@ -427,3 +428,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# TODO: Fleet Monitor is not released yet — remove this line to publish it.
+fleet-monitor/

@@ -186,9 +186,15 @@ class DeviceWorker:
 
         # RS41 bandwidth fast-path (see _identify_sonde_type). Skips the ~15s
         # dft_detect step for signals whose 3 dB width is unambiguously RS41,
-        # restoring V1.0.50's instant, reliable RS41 start. Tunable via config.
+        # restoring V1.0.50's instant RS41 start. DEFAULT OFF: it trades the
+        # correlation check for a bandwidth guess, which is exactly what let a
+        # narrow-measuring DFM be started as RS41 (the misclassification we kept
+        # chasing). With it off, every candidate is classified purely by
+        # dft_detect (auto_rx's method) — more reliable, ~15s slower per RS41.
+        # Re-enable per gateway with detection.rs41_fastpath: true where the
+        # speed matters and DFM confusion isn't a problem.
         det_cfg = app_config.get('detection', {})
-        self.RS41_FASTPATH_ENABLED = bool(det_cfg.get('rs41_fastpath', True))
+        self.RS41_FASTPATH_ENABLED = bool(det_cfg.get('rs41_fastpath', False))
         self.RS41_FASTPATH_BW_MIN = float(det_cfg.get('rs41_fastpath_bw_min_hz', 3500))
         self.RS41_FASTPATH_BW_MAX = float(det_cfg.get('rs41_fastpath_bw_max_hz', 7000))
 
@@ -345,7 +351,11 @@ class DeviceWorker:
             # existing configs don't need editing.
             self._dft = DftDetector(
                 dft_detect_path=det_cfg.get('dft_detect_path', 'dft_detect'),
-                sample_duration=det_cfg.get('detect_confirm_time', det_cfg.get('dft_sample_duration', 5.0))
+                sample_duration=det_cfg.get('detect_confirm_time', det_cfg.get('dft_sample_duration', 5.0)),
+                # Per-station correlation threshold overrides. Optional: when
+                # absent, DftDetector.DEFAULT_THRESHOLDS (auto_rx's calibrated
+                # values) apply, so existing configs keep working unchanged.
+                thresholds=det_cfg.get('dft_thresholds') or None,
             )
         else:
             self._dft = None
