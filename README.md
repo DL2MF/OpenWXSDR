@@ -88,6 +88,12 @@ The RS92 data validation was successfully granted, it may take some time until s
   hourly for the UTC‑midnight day rollover. A **System Health "Ephemeris"** row
   shows ready/pending (only when enabled).
 
+## 🔧 New Setup check tool integrated
+
+  <img width="1629" height="966" alt="grafik" src="https://github.com/user-attachments/assets/80f564de-f1c5-4f95-a113-b5c0aa2f0164" />
+
+Inline check of the installation and configuration of optional modules.
+
 See changelog in the release section for all details.
 
 #### 🔧 New configuration utility
